@@ -13,4 +13,4 @@ for split, recs in dataset.sets.items():
     for i, arr in enumerate(recs):
         np.save(os.path.join(d, f"rec_{i:04d}.npy"), arr)
 
-print("Exported in:", out, "the files are already normalized and stored as numpy arrays.")
+print("Exported in: /", out, "/ the file are now normalized and saved as .npy")
