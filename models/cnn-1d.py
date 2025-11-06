@@ -41,7 +41,7 @@ class ConvBlock(nn.Module):
 
         self.conv = nn.Conv1d(in_channel, out_channel, kernel_size, stride = stride, padding = padding, bias = False)
         self.bn = nn.BatchNorm1d(out_channel)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace = True)
         self.dropout = nn.Dropout(p = dropout) if dropout and dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
