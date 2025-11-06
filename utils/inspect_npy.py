@@ -37,7 +37,7 @@ def _preview_array(arr):
         print(df.head())
     else:
         print("Array with dimension > 2, showing the first section:")
-        print(arr.take(indices=range(min(3, arr.shape[0])), axis=0))
+        print(arr.take(indices = range(min(3, arr.shape[0])), axis = 0))
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
