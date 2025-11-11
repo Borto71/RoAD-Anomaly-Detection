@@ -1,3 +1,4 @@
 /data/dataset/
 /models/__pycache__/
 /models/cnn_1d.pyc
+road_cnn.pt
