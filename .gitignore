@@ -3,3 +3,4 @@
 /models/cnn_1d.pyc
 /result/
 road_cnn.pt
+artifacts/
