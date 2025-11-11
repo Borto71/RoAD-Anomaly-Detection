@@ -1,16 +1,28 @@
-import os, numpy as np
+import os
+import numpy as np
+import pandas as pd
 from RoADDataset import Dataset
 
-dataset = Dataset() 
+output_dir = "dataset"
+os.makedirs(output_dir, exist_ok = True)
 
-out = "dataset"
-os.makedirs(out, exist_ok = True)
 
-for split, recs in dataset.sets.items():
-    d = os.path.join(out, split)
-    os.makedirs(d, exist_ok = True)
+dataset = Dataset(normalize = True)  
 
-    for i, arr in enumerate(recs):
-        np.save(os.path.join(d, f"rec_{i:04d}.npy"), arr)
 
-print("Exported in: /", out, "/ the file are now normalized and saved as .npy")
+for subset_name, recordings in dataset.sets.items():
+    subset_dir = os.path.join(output_dir, subset_name)
+    os.makedirs(subset_dir, exist_ok=True)
+    print(f"Extraction from the subset: {subset_name} ({len(recordings)} registration)")
+
+
+    for i, rec in enumerate(recordings):
+        
+        filename = f"{subset_name}_{i:04d}.csv"
+        filepath = os.path.join(subset_dir, filename)
+
+        
+        df = pd.DataFrame(rec)
+        df.to_csv(filepath, index = False, header = False)
+
+print("\nExtraction completed in the folder './dataset'")
