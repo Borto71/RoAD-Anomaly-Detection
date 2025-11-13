@@ -376,7 +376,7 @@ def main():
     else:
         print("Using CPU (no CUDA available)")
 
-    # ATTENZIONE: si assume che i CSV siano stati generati con Dataset(normalize=False)
+
     data_root = Path("data/dataset")
     assert data_root.exists(), "data/dataset folder not found. Export CSVs first."
 
