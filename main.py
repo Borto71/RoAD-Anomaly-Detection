@@ -67,7 +67,6 @@ def read_csv_return_features_labels(
     if label_col in cols:
         feature_cols = [c for c in cols if c != label_col]
         y_raw = df[label_col].astype(float).values
-        # Binarizza in modo robusto, qualsiasi cosa ci sia (0/1, 0/1.0, ecc.)
         y = (y_raw > 0.5).astype(np.float32)
     else:
         feature_cols = cols
@@ -82,7 +81,7 @@ def fit_scaler_on_train_files(
 ) -> StandardScaler:
     """
     Fit StandardScaler on TRAIN files only (concatenate along time),
-    SOLO sulle feature (label esclusa).
+    only on features (no label).
     """
     scaler = StandardScaler(with_mean=True, with_std=True)
     chunks = []
@@ -108,11 +107,12 @@ class WindowedSeqDataset(Dataset):
     """
     Convert per-file time series into overlapping windows (C, T) plus a window label.
 
-    Label policy:
-      - If frame-level labels exist: window label = 1 se QUALSIASI frame dentro è anomalo.
-      - If labels are absent: window label = 0 (normal).
+    Label policy (NUOVA):
+      - Calcola la percentuale di frame anomali nella finestra.
+      - window_label = 1 se percentuale >= min_anomaly_ratio, altrimenti 0.
+      - Se il file non ha etichette, la finestra è 0 (normale).
 
-    Includes an in-RAM cache per file to avoid repeated CSV parsing and scaling.
+    Questo evita che una singola anomalia "contamini" centinaia di finestre.
     """
 
     def __init__(
@@ -121,8 +121,9 @@ class WindowedSeqDataset(Dataset):
         scaler: StandardScaler,
         feature_cols: List[str],
         label_col: str = "anomaly",
-        window_size: int = 512,
-        step_size: int = 128,
+        window_size: int = 128,
+        step_size: int = 64,
+        min_anomaly_ratio: float = 0.2,
         progress_desc: str = "Indexing windows",
         cache_in_ram: bool = True,
     ):
@@ -132,6 +133,7 @@ class WindowedSeqDataset(Dataset):
         self.label_col = label_col
         self.window_size = window_size
         self.step_size = step_size
+        self.min_anomaly_ratio = min_anomaly_ratio
         self.cache_in_ram = cache_in_ram
 
         self.index: List[Tuple[int, int, int]] = []  # (file_idx, start, end)
@@ -166,7 +168,7 @@ class WindowedSeqDataset(Dataset):
         tqdm.write(
             f"{progress_desc}: indexed {total_windows} windows from {len(self.files)} files."
         )
-        # Gruppo di appartenenza = file path (per eventuali split successivi)
+        # Group = file path
         self.groups = np.array(
             [self.files[i].as_posix() for (i, _, _) in self.index]
         )
@@ -184,16 +186,22 @@ class WindowedSeqDataset(Dataset):
             X_full, y_full, _ = read_csv_return_features_labels(
                 f, label_col=self.label_col
             )
-            X_full = apply_scaler(X_full, self.scaler)  # scale once here if not cached
+            X_full = apply_scaler(X_full, self.scaler)
 
         Xw = X_full[s:e]  # (T, C)
+
         if len(y_full) >= e:
             yw = y_full[s:e]
         else:
             yw = np.zeros(e - s, dtype=np.float32)
 
-        # Window label: 1 se QUALSIASI frame è anomalo
-        label = float(np.any(yw > 0.5))
+        # percentuale di frame anomali nella finestra
+        if len(yw) > 0:
+            anomaly_ratio = float(np.mean(yw > 0.5))
+        else:
+            anomaly_ratio = 0.0
+
+        label = float(anomaly_ratio >= self.min_anomaly_ratio)
 
         # (T, C) -> (C, T) per Conv1d
         Xw = torch.from_numpy(Xw.astype(np.float32)).permute(1, 0)
@@ -207,9 +215,6 @@ class WindowedSeqDataset(Dataset):
 def train_one_epoch(
     model, loader, criterion, optimizer, device, amp_scaler
 ) -> Dict[str, float]:
-    """
-    Uses AMP (mixed precision) and non_blocking transfers to better utilize the GPU.
-    """
     model.train()
     losses = []
 
@@ -234,14 +239,6 @@ def train_one_epoch(
 
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
-    """
-    Evaluate on validation loader and compute a rich set of metrics:
-      - loss, AUROC, AUPRC
-      - accuracy, precision, recall, F1 (soglia 0.5)
-      - best F1 + soglia ottima (grid search)
-      - accuracy per classe (class 0 / class 1)
-      - support per classe
-    """
     model.eval()
     losses = []
     y_true_all, y_score_all = [], []
@@ -261,7 +258,6 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
         y_true_all.append(y.detach().cpu().numpy())
 
     if not y_true_all:
-        # empty loader edge-case
         return {
             "loss": float("nan"),
             "auroc": float("nan"),
@@ -276,12 +272,16 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
             "acc_class1": float("nan"),
             "support_class0": 0,
             "support_class1": 0,
+            "cm_tn": 0,
+            "cm_fp": 0,
+            "cm_fn": 0,
+            "cm_tp": 0,
         }
 
     y_true = np.concatenate(y_true_all)
     y_score = np.concatenate(y_score_all)
 
-    # --- Soglia migliore (per info) ---
+    # Best threshold (for info)
     best_f1, best_th = -1.0, 0.5
     threshs = np.linspace(0.05, 0.95, 19)
     for th in threshs:
@@ -292,7 +292,7 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
         if f1 > best_f1:
             best_f1, best_th = f1, th
 
-    # --- Soglia "standard" 0.5 ---
+    # Fixed threshold 0.5
     y_pred = (y_score >= 0.5).astype(int)
 
     acc = accuracy_score(y_true, y_pred)
@@ -300,7 +300,6 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
         y_true, y_pred, average="binary", zero_division=0
     )
 
-    # --- AUROC / AUPRC (safe) ---
     def _safe_metric(fn, *args, **kwargs):
         try:
             return float(fn(*args, **kwargs))
@@ -310,13 +309,10 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
     auroc = _safe_metric(roc_auc_score, y_true, y_score)
     auprc = _safe_metric(average_precision_score, y_true, y_score)
 
-    # --- Accuracy per classe ---
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    # Gestione robusta (es. se una classe manca)
     if cm.shape == (2, 2):
         tn, fp, fn, tp = cm.ravel()
     else:
-        # Fallback conservativo
         tn = fp = fn = tp = 0
         for i, row_label in enumerate([0, 1][: cm.shape[0]]):
             for j, col_label in enumerate([0, 1][: cm.shape[1]]):
@@ -349,6 +345,10 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
         "acc_class1": acc_class1,
         "support_class0": support_class0,
         "support_class1": support_class1,
+        "cm_tn": int(tn),
+        "cm_fp": int(fp),
+        "cm_fn": int(fn),
+        "cm_tp": int(tp),
     }
 
 
@@ -358,7 +358,7 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
 def main():
     seed_everything(42)
 
-    # ---- Favor GPU performance ----
+    # GPU preferences
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.deterministic = False
@@ -368,7 +368,6 @@ def main():
     except Exception:
         pass
 
-    # Select device and print it
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
@@ -376,18 +375,19 @@ def main():
     else:
         print("Using CPU (no CUDA available)")
 
-
     data_root = Path("data/dataset")
     assert data_root.exists(), "data/dataset folder not found. Export CSVs first."
 
     # 1) Discover files and reference feature order from FIRST file
     all_csv = list_csv_files(data_root)
     assert len(all_csv) > 0, "No CSV found under data/dataset/"
-    X0, _, feature_cols = read_csv_return_features_labels(all_csv[0], label_col="anomaly")
+    X0, _, feature_cols = read_csv_return_features_labels(
+        all_csv[0], label_col="anomaly"
+    )
     n_features = X0.shape[1]
     tqdm.write(f"Discovered {len(all_csv)} CSV files. Detected {n_features} features.")
 
-    # 2) Split at FILE level (no window leakage), with file-level anomaly stratification
+    # 2) Split at FILE level with stratification by presence of anomaly
     def file_has_anomaly(p: Path) -> int:
         _, y, _ = read_csv_return_features_labels(p, "anomaly")
         return int(np.any(y > 0.5))
@@ -421,9 +421,10 @@ def main():
     tqdm.write("Scaler saved to artifacts/scaler.joblib")
 
     # 4) Build datasets / loaders (windowed) — caching ON
-    window_size = 512
-    step_size = 128
-    batch_size = 256  # aumentalo se hai VRAM
+    window_size = 128
+    step_size = 64
+    min_anomaly_ratio = 0.2  # almeno il 20% di frame anomali nella finestra
+    batch_size = 256
 
     ds_train = WindowedSeqDataset(
         train_files,
@@ -432,6 +433,7 @@ def main():
         label_col="anomaly",
         window_size=window_size,
         step_size=step_size,
+        min_anomaly_ratio=min_anomaly_ratio,
         progress_desc="Indexing windows (train)",
         cache_in_ram=True,
     )
@@ -442,6 +444,7 @@ def main():
         label_col="anomaly",
         window_size=window_size,
         step_size=step_size,
+        min_anomaly_ratio=min_anomaly_ratio,
         progress_desc="Indexing windows (val)",
         cache_in_ram=True,
     )
@@ -491,7 +494,6 @@ def main():
         optimizer, mode="min", factor=0.5, patience=3
     )
 
-    # AMP GradScaler for mixed precision training
     amp_scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # 7) Training loop
@@ -507,10 +509,8 @@ def main():
         tr = train_one_epoch(model, train_loader, criterion, optimizer, device, amp_scaler)
         ev = eval_epoch(model, val_loader, criterion, device)
 
-        # ReduceLROnPlateau on validation loss
         scheduler.step(ev["loss"])
 
-        # Track metrics (in modo completo)
         entry = {
             "epoch": epoch,
             "train_loss": tr["loss"],
@@ -527,6 +527,10 @@ def main():
             "val_acc_class1": ev["acc_class1"],
             "val_support_class0": ev["support_class0"],
             "val_support_class1": ev["support_class1"],
+            "val_tn": ev["cm_tn"],
+            "val_fp": ev["cm_fp"],
+            "val_fn": ev["cm_fn"],
+            "val_tp": ev["cm_tp"],
             "lr": optimizer.param_groups[0]["lr"],
             "epoch_time_sec": round(time.time() - t0, 2),
         }
@@ -565,7 +569,6 @@ def main():
                 f"  ↳ Saved new best checkpoint to {best_ckpt} (score={best_val:.4f})"
             )
 
-        # Persist logs after each epoch
         pd.DataFrame(history).to_csv(artifacts / "training_log.csv", index=False)
         with open(artifacts / "training_log.json", "w") as f:
             json.dump(history, f, indent=2)

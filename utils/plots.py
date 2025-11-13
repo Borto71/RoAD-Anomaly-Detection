@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 from pathlib import Path
 
@@ -67,6 +64,7 @@ def generate_all_plots(
         Directory where plots will be saved.
     confusion_matrix_values : np.ndarray | None
         If provided, saves a confusion matrix plot.
+        If None, tries to read val_tn/val_fp/val_fn/val_tp from the log file.
     """
 
     out_dir = Path(out_dir)
@@ -156,6 +154,19 @@ def generate_all_plots(
     # ---------------------------------------------------------
     # 7. Confusion Matrix
     # ---------------------------------------------------------
+    # Se non viene passata dall'esterno, prova a ricostruirla dall'ultimo epoch
+    if confusion_matrix_values is None:
+        required_cols = {"val_tn", "val_fp", "val_fn", "val_tp"}
+        if required_cols.issubset(df.columns):
+            last = df.iloc[-1]
+            cm = np.array(
+                [
+                    [int(last["val_tn"]), int(last["val_fp"])],
+                    [int(last["val_fn"]), int(last["val_tp"])],
+                ]
+            )
+            confusion_matrix_values = cm
+
     if confusion_matrix_values is not None:
         plot_confusion_matrix(
             np.array(confusion_matrix_values),
