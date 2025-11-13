@@ -48,7 +48,7 @@ def main(out_dir: Path = Path("dataset")):
     out_dir.mkdir(parents = True, exist_ok = True)
 
     # Load the dataset with normalization
-    ds = Dataset(normalize = True)  # using the internal normalization
+    ds = Dataset(normalize = False)  # not using the internal normalization
     subsets = ds.sets.keys()
 
     meta = {
