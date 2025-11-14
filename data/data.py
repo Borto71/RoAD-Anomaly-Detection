@@ -14,7 +14,7 @@ except ImportError:
     )
     sys.exit(1)
 
-# Intestazioni delle 87 feature (dal README del repo)
+# Intestation of CSV files
 HEADERS = [
     # global
     "robot_action_id", "apparent_power", "current", "frequency", "phase_angle",

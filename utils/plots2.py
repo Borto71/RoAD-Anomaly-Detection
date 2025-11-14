@@ -75,9 +75,7 @@ def generate_all_plots(
 
     df = pd.read_csv(log_path)
 
-    # ---------------------------------------------------------
     # 1. Loss (Train vs Val)
-    # ---------------------------------------------------------
     plot_multi_and_save(
         df,
         "epoch",
@@ -88,9 +86,7 @@ def generate_all_plots(
         out_dir / "loss.png",
     )
 
-    # ---------------------------------------------------------
     # 2. AUPRC
-    # ---------------------------------------------------------
     plot_and_save(
         df,
         "epoch",
@@ -100,9 +96,7 @@ def generate_all_plots(
         out_dir / "auprc.png",
     )
 
-    # ---------------------------------------------------------
-    # 3. F1 Score (threshold 0.5 e Best F1)
-    # ---------------------------------------------------------
+    # 3. F1 Score (threshold 0.5 and Best F1)
     plot_multi_and_save(
         df,
         "epoch",
@@ -113,9 +107,7 @@ def generate_all_plots(
         out_dir / "f1_scores.png",
     )
 
-    # ---------------------------------------------------------
-    # 4. Accuracy per classe (0 e 1)
-    # ---------------------------------------------------------
+    # 4. Accuracy for classe (0 e 1)
     plot_multi_and_save(
         df,
         "epoch",
@@ -126,9 +118,7 @@ def generate_all_plots(
         out_dir / "class_accuracy.png",
     )
 
-    # ---------------------------------------------------------
     # 5. Precision - Recall - Accuracy
-    # ---------------------------------------------------------
     plot_multi_and_save(
         df,
         "epoch",
@@ -139,9 +129,7 @@ def generate_all_plots(
         out_dir / "prec_rec_acc.png",
     )
 
-    # ---------------------------------------------------------
     # 6. Learning Rate
-    # ---------------------------------------------------------
     plot_and_save(
         df,
         "epoch",
@@ -151,10 +139,7 @@ def generate_all_plots(
         out_dir / "learning_rate.png",
     )
 
-    # ---------------------------------------------------------
     # 7. Confusion Matrix
-    # ---------------------------------------------------------
-    # Se non viene passata dall'esterno, prova a ricostruirla dall'ultimo epoch
     if confusion_matrix_values is None:
         required_cols = {"val_tn", "val_fp", "val_fn", "val_tp"}
         if required_cols.issubset(df.columns):

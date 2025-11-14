@@ -6,146 +6,295 @@ import torch.nn.functional as F
 
 class ConvBlock(nn.Module):
     """
-    A basic 1D convolutional block:
-    Conv1d -> BatchNorm -> GELU -> Dropout
+    Basic 1D convolutional block:
+    Conv1d -> BatchNorm1d -> GELU (or other non-linearity) -> Dropout.
+
+    This block keeps the temporal resolution (same T) when:
+        padding = dilation * (kernel_size - 1) // 2
+        stride = 1
 
     Args:
-        in_ch:    input channels
-        out_ch:   output channels
+        in_ch:    number of input channels
+        out_ch:   number of output channels
         k:        kernel size
         s:        stride
-        p:        padding
+        dilation: temporal dilation factor
         dropout:  dropout probability
     """
-    def __init__(self, in_ch: int, out_ch: int, k: int, s: int = 1, p: Optional[int] = None, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        k: int = 3,
+        s: int = 1,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-        if p is None:
-            p = k // 2  # "same" padding when stride = 1
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size = k, stride = s, padding = p, bias = False)
+
+        # Choose padding so that, with stride = 1, the temporal length is preserved.
+        padding = (k - 1) // 2 * dilation
+
+        self.conv = nn.Conv1d(
+            in_ch,
+            out_ch,
+            kernel_size = k,
+            stride = s,
+            padding = padding,
+            dilation = dilation,
+            bias = False,
+        )
         self.bn = nn.BatchNorm1d(out_ch)
         self.act = nn.GELU()
-        self.do = nn.Dropout(dropout)
+        self.drop = nn.Dropout(p = dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: tensor of shape (B, C_in, T)
+
+        Returns:
+            Tensor of shape (B, C_out, T_out)
+        """
         x = self.conv(x)
         x = self.bn(x)
         x = self.act(x)
-        x = self.do(x)
+        x = self.drop(x)
         return x
 
 
 class ResidualBlock(nn.Module):
     """
-    Residual block with two ConvBlocks and a 1x1 shortcut if dimensions change.
-    This stabilizes training on long sequences and improves gradient flow.
+    Residual block with two ConvBlocks and an optional 1x1 shortcut.
+
+    The main idea is:
+        y = F(main(x) + shortcut(x))
+
+    If in_ch != out_ch or stride > 1, the shortcut uses a 1x1 conv
+    to match shapes.
+
+    Args:
+        in_ch:    input channels
+        out_ch:   output channels
+        k:        kernel size for the main convolutions
+        s:        stride for the first convolution (can be >1 to downsample)
+        dilation: dilation factor for the convolutions
+        dropout:  dropout probability inside the ConvBlocks
     """
-    def __init__(self, in_ch: int, out_ch: int, k: int, s: int = 1, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        k: int = 3,
+        s: int = 1,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.block1 = ConvBlock(in_ch, out_ch, k = k, s = s, dropout = dropout)
-        self.block2 = ConvBlock(out_ch, out_ch, k = k, s = 1, dropout = dropout)
-        self.proj = None
-        if in_ch != out_ch or s != 1:
-            self.proj = nn.Conv1d(in_ch, out_ch, kernel_size = 1, stride = s, bias = False)
+
+        self.conv1 = ConvBlock(
+            in_ch,
+            out_ch,
+            k = k,
+            s = s,
+            dilation = dilation,
+            dropout = dropout,
+        )
+        # Second conv keeps stride=1 so that only the first convolution
+        # controls the potential downsampling.
+        self.conv2 = ConvBlock(
+            out_ch,
+            out_ch,
+            k = k,
+            s = 1,
+            dilation = dilation,
+            dropout = dropout,
+        )
+
+        # Optional shortcut to match (C, T) shape.
+        if s != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size = 1, stride = s, bias = False),
+                nn.BatchNorm1d(out_ch),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+        # Extra non-linearity after the residual addition.
+        self.out_act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        out = self.block1(x)
-        out = self.block2(out)
-        if self.proj is not None:
-            identity = self.proj(identity)
-        return F.gelu(out + identity)
+        """
+        Args:
+            x: tensor of shape (B, C_in, T)
+
+        Returns:
+            Tensor of shape (B, C_out, T_out)
+        """
+        residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + residual
+        out = self.out_act(out)
+        return out
 
 
 class RoADCNN1D(nn.Module):
     """
-    CNN-1D model for anomaly detection.
+    CNN-1D model for anomaly detection on multi-variate time series.
+
+    This version is optimized for **frame-level** training:
+    - The network preserves the temporal resolution (same T) throughout.
+    - A 1x1 convolution produces per-timestep logits (frame_logits).
+    - The sequence-level logit is derived from frame_logits using a pooling
+      operation across time (e.g. top-k or max pooling).
 
     Inputs:
         x: Tensor of shape (B, C, T)
            B = batch size, C = feature channels (e.g., 86), T = timesteps.
 
     Outputs:
-        A tuple (logit, frame_logits) where:
-        - logit: shape (B, 1) sequence-level anomaly score (raw logit).
-        - frame_logits: shape (B, 1, T') optional per-timestep logits after the
-          last convolutional downsampling stage (useful for weak supervision).
-          Returned only if `return_frame_logits=True`.
+        A tuple (seq_logit, frame_logits) where:
+        - seq_logit: shape (B, 1), sequence-level anomaly score (raw logit).
+                     This is obtained by pooling frame_logits along time.
+        - frame_logits: shape (B, 1, T), per-timestep logits.
+          If `return_frame_logits=False`, this may be returned as None to
+          save memory at inference time.
 
-    Design:
-        - Stem + 3 residual stages with progressive channel expansion and
-          occasional temporal downsampling (stride=2).
-        - Dual global pooling (avg + max) then a small MLP head.
-        - Optional 1x1 conv head for frame-wise scores.
+    Design choices for frame-level supervision:
+        - No temporal downsampling (stride = 1), so that each output time
+          index can be directly aligned with a frame-level label.
+        - Dilated convolutions in deeper stages to enlarge the receptive
+          field without losing temporal resolution.
+        - Sequence-level score computed from frame_logits instead of a
+          separate global head, so that both levels (frame & sequence)
+          are consistent.
     """
     def __init__(
         self,
-        in_channels: int = 86,      # use 86 features; exclude channel 87 (label)
+        in_channels: int = 86,      # number of input features; exclude label channel
         base_channels: int = 64,    # width of the first stage
         dropout: float = 0.1,
         return_frame_logits: bool = False,
-    ):
+        seq_pooling: str = "topk",  # "topk", "max", or "avg"
+        topk_ratio: float = 0.1,    # fraction of timesteps used in top-k pooling
+    ) -> None:
         super().__init__()
         self.return_frame_logits = return_frame_logits
+        self.seq_pooling = seq_pooling
+        self.topk_ratio = topk_ratio
 
-        # ----- Feature extractor (hierarchical CNN) -----
-        self.stem = ConvBlock(in_channels, base_channels, k = 7, s = 1, dropout=dropout)
+        # Feature extractor: 4 stages of residual blocks with increasing
+        self.stem = ConvBlock(
+            in_channels,
+            base_channels,
+            k = 7,
+            s = 1,
+            dilation = 1,
+            dropout = dropout,
+        )
 
-        self.stage1 = ResidualBlock(base_channels, base_channels, k = 7, s = 1, dropout = dropout)
-        self.stage2 = ResidualBlock(base_channels, base_channels * 2, k = 5, s = 2, dropout = dropout)   # downsample
-        self.stage3 = ResidualBlock(base_channels * 2, base_channels * 4, k = 3, s = 2, dropout = dropout) # downsample
-        self.stage4 = ResidualBlock(base_channels * 4, base_channels * 4, k = 3, s = 1, dropout = dropout)
+        # Stage 1: no dilation, still local.
+        self.stage1 = ResidualBlock(
+            base_channels,
+            base_channels,
+            k=7,
+            s=1,
+            dilation=1,
+            dropout=dropout,
+        )
+
+        # Stage 2: increase channels, moderate dilation.
+        self.stage2 = ResidualBlock(
+            base_channels,
+            base_channels * 2,
+            k=5,
+            s=1,
+            dilation=2,
+            dropout=dropout,
+        )
+
+        # Stage 3: more channels, larger dilation for longer temporal context.
+        self.stage3 = ResidualBlock(
+            base_channels * 2,
+            base_channels * 4,
+            k=5,
+            s=1,
+            dilation=4,
+            dropout=dropout,
+        )
+
+        # Stage 4: keep width, even larger dilation to capture slow trends.
+        self.stage4 = ResidualBlock(
+            base_channels * 4,
+            base_channels * 4,
+            k=3,
+            s=1,
+            dilation=8,
+            dropout=dropout,
+        )
 
         feat_dim = base_channels * 4
 
-        # ----- Sequence-level head (global pooling + MLP) -----
-        # We concatenate avg and max pooled features to capture both trend and bursts.
-        self.head = nn.Sequential(
-            nn.Linear(feat_dim * 2, feat_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(feat_dim // 2, 1)  # single logit for binary anomaly classification
+        # Frame-level head:
+        # 1x1 convolution that maps the feature dimension to a single logit per timestep.
+        self.frame_head = nn.Conv1d(
+            feat_dim,
+            1,
+            kernel_size = 1,
+            stride = 1,
+            padding = 0,
         )
 
-        # ----- Optional frame-level head -----
-        if self.return_frame_logits:
-            self.frame_head = nn.Conv1d(feat_dim, 1, kernel_size = 1)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        # Kaiming initialization for conv layers, xavier for linear layers.
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity = "relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # x: (B, C, T)
+        """
+        Forward pass.
+
+        Args:
+            x: tensor of shape (B, C, T)
+
+        Returns:
+            seq_logit:    (B, 1)   sequence-level logit
+            frame_logits: (B, 1, T) per-timestep logits, or None if
+                          return_frame_logits=False and you wish to save memory.
+        """
+        # Feature extractor
         x = self.stem(x)
         x = self.stage1(x)
         x = self.stage2(x)
         x = self.stage3(x)
-        x = self.stage4(x)     # features: (B, F, T')
+        x = self.stage4(x)       # (B, F, T), temporal length preserved
 
-        # Global pooling (keep both statistics)
-        avg_pool = F.adaptive_avg_pool1d(x, 1).squeeze(-1)   # (B, F)
-        max_pool = F.adaptive_max_pool1d(x, 1).squeeze(-1)   # (B, F)
-        pooled = torch.cat([avg_pool, max_pool], dim=1)      # (B, 2F)
+        # Frame-level logits: per-timestep anomaly score.
+        frame_logits = self.frame_head(x)  # (B, 1, T)
 
-        logit = self.head(pooled)                             # (B, 1)
+        # ----- Sequence-level pooling from frame_logits -----
+        # We pool over the temporal dimension to obtain a single score per window.
+        # This makes the sequence-level decision directly consistent with the
+        # frame-level scores.
+        if self.seq_pooling == "avg":
+            # Simple average over time.
+            seq_logit = frame_logits.mean(dim=-1)  # (B, 1)
+        elif self.seq_pooling == "max":
+            # Max pooling focuses on the most anomalous timestep.
+            seq_logit, _ = frame_logits.max(dim=-1)  # (B, 1)
+        else:
+            # Top-k pooling (default):
+            # take the mean over the k most anomalous timesteps.
+            # This is more robust than a pure max, while still focusing
+            # on the "peaks" of anomaly.
+            B, C, T = frame_logits.shape
+            k = max(1, int(self.topk_ratio * T))
+            # If topk_ratio is very small and T is small, k may fall back to 1.
+            topk_vals, _ = torch.topk(frame_logits, k=k, dim=-1)
+            seq_logit = topk_vals.mean(dim=-1)  # (B, 1)
 
         if self.return_frame_logits:
-            frame_logits = self.frame_head(x)                 # (B, 1, T')
-            return logit, frame_logits
+            return seq_logit, frame_logits
         else:
-            return logit, None
+            # If you do not need per-frame scores (e.g., at inference), you can
+            # set return_frame_logits=False when building the model to save memory.
+            return seq_logit, None
 
 
 def build_model(
@@ -155,16 +304,16 @@ def build_model(
     return_frame_logits: bool = False,
 ) -> RoADCNN1D:
     """
-    Factory to create the CNN model. Keep the signature stable so it can be
-    imported from a training script (main).
+    Factory to create the CNN model. The signature is kept stable so it can be
+    imported from a training script.
 
     Example:
-        from model_cnn1d import build_model
+        from cnn_1d import build_model
         model = build_model(in_channels=86, base_channels=64, dropout=0.1)
     """
     return RoADCNN1D(
-        in_channels=in_channels,
-        base_channels=base_channels,
-        dropout=dropout,
-        return_frame_logits=return_frame_logits,
+        in_channels = in_channels,
+        base_channels = base_channels,
+        dropout = dropout,
+        return_frame_logits = return_frame_logits,
     )

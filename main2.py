@@ -1,13 +1,11 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import json
 import math
 import time
 import random
+import os
+import json
 from pathlib import Path
 from typing import List, Tuple, Dict
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -16,6 +14,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -27,10 +26,11 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupShuffleSplit
 
+# model import
+from models.cnn_1d import RoADCNN1D as CNN1D
 
-# -------------------------
-# Reproducibility helpers
-# -------------------------
+
+# Helper for reproducibility
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -40,9 +40,7 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-# -------------------------
-# Data loading utilities
-# -------------------------
+# Data Loading and Preprocessing
 def list_csv_files(root: Path) -> List[Path]:
     """Recursively list all CSV files under root (data/dataset/<subset>/*.csv)."""
     return sorted(root.rglob("*.csv"))
@@ -97,16 +95,14 @@ def apply_scaler(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
     return scaler.transform(X)
 
 
-# -------------------------
-# Frame-level Dataset (no windows)
-# -------------------------
+# Frame-level Dataset
 class FrameDataset(Dataset):
     """
-    Ogni riga del CSV è un esempio:
-      - X: feature del singolo frame (shape: [C])
-      - y: label anomaly 0/1 del singolo frame
+    Each row of the CSV is a sample:
+      - X: features of a single frame (shape: [C])
+      - y: anomaly label 0/1 of the same frame
 
-    Manteniamo il caching per file in RAM come nel dataset a finestre.
+    We keep per-file caching in RAM to reduce I/O overhead.
     """
 
     def __init__(
@@ -150,7 +146,7 @@ class FrameDataset(Dataset):
             f"{progress_desc}: indexed {total_frames} frames from {len(self.files)} files."
         )
 
-        # Gruppi per eventuali split a posteriori (non necessari qui)
+        # group per file path (useful if you want group-based splitting later)
         self.groups = np.array(
             [self.files[i].as_posix() for (i, _) in self.index]
         )
@@ -170,7 +166,7 @@ class FrameDataset(Dataset):
             )
             X_full = apply_scaler(X_full, self.scaler)
 
-        x = X_full[t]          # (C,)
+        x = X_full[t]  # (C,)
         y = y_full[t] if t < len(y_full) else 0.0
 
         x = torch.from_numpy(x.astype(np.float32))  # (C,)
@@ -178,50 +174,30 @@ class FrameDataset(Dataset):
         return x, y
 
 
-# -------------------------
-# Simple MLP model (frame-level)
-# -------------------------
-class SimpleMLP(nn.Module):
-    """
-    Piccolo MLP per dati tabellari:
-    input: (B, n_features)
-    output: logits shape (B, 1)
-    """
-
-    def __init__(self, in_features: int, hidden_sizes=(256, 128), dropout: float = 0.2):
-        super().__init__()
-        layers = []
-        last = in_features
-        for h in hidden_sizes:
-            layers.append(nn.Linear(last, h))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.Dropout(dropout))
-            last = h
-        layers.append(nn.Linear(last, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        # x: (B, in_features)
-        logits = self.net(x)  # (B, 1)
-        return logits.squeeze(-1), None  # compatibile con il resto del codice
-
-
-# -------------------------
-# Training & evaluation
-# -------------------------
+# Training and Evaluation Functions
 def train_one_epoch(
-    model, loader, criterion, optimizer, device, amp_scaler
+    model, loader, criterion, optimizer, device, amp_scaler: GradScaler
 ) -> Dict[str, float]:
     model.train()
     losses = []
 
+    is_cuda = device.type == "cuda"
+
     for X, y in tqdm(loader, desc="Train", leave=False):
-        X = X.to(device, non_blocking=True)  # (B, F)
+        # X: (B, C) -> reshape to (B, C, 1) for frame-level CNN
+        X = X.to(device, non_blocking=True).unsqueeze(-1)
         y = y.to(device, non_blocking=True)  # (B,)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            logits, _ = model(X)  # (B,)
+
+        ctx = torch.autocast(
+            device_type="cuda", dtype=torch.float16, enabled=is_cuda
+        ) if is_cuda else nullcontext()
+
+        with ctx:
+            # RoADCNN1D returns (seq_logit, frame_logits)
+            seq_logit, _ = model(X)          # seq_logit: (B, 1)
+            logits = seq_logit.squeeze(-1)   # (B,)
             loss = criterion(logits, y)
 
         amp_scaler.scale(loss).backward()
@@ -239,12 +215,19 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
     losses = []
     y_true_all, y_score_all = [], []
 
+    is_cuda = device.type == "cuda"
+
     for X, y in tqdm(loader, desc="Val", leave=False):
-        X = X.to(device, non_blocking=True)
+        X = X.to(device, non_blocking=True).unsqueeze(-1)  # (B, C, 1)
         y = y.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            logits, _ = model(X)
+        ctx = torch.autocast(
+            device_type="cuda", dtype=torch.float16, enabled=is_cuda
+        ) if is_cuda else nullcontext()
+
+        with ctx:
+            seq_logit, _ = model(X)         # (B, 1)
+            logits = seq_logit.squeeze(-1)  # (B,)
             loss = criterion(logits, y)
 
         losses.append(loss.item())
@@ -276,7 +259,7 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
     y_true = np.concatenate(y_true_all)
     y_score = np.concatenate(y_score_all)
 
-    # Best threshold (per info)
+    # Best threshold (for info)
     best_f1, best_th = -1.0, 0.5
     threshs = np.linspace(0.05, 0.95, 19)
     for th in threshs:
@@ -287,7 +270,7 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
         if f1 > best_f1:
             best_f1, best_th = f1, th
 
-    # Soglia fissa 0.5
+    # 0.5 threshold metrics
     y_pred = (y_score >= 0.5).astype(int)
 
     acc = accuracy_score(y_true, y_pred)
@@ -347,13 +330,11 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
     }
 
 
-# -------------------------
 # Orchestration
-# -------------------------
 def main():
     seed_everything(42)
 
-    # GPU preferences
+    # GPU preferences: enable TF32 and fast kernels where possible
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.deterministic = False
@@ -366,7 +347,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        print(f"Using GPU: {gpu_name}")
+        print(f"Using GPU: {gpu_name} ({torch.cuda.device_count()} device(s))")
     else:
         print("Using CPU (no CUDA available)")
 
@@ -449,7 +430,7 @@ def main():
         f"neg: {int(n_neg)}, pos_weight: {pos_weight.item():.2f}"
     )
 
-    # (facoltativo ma utile: stampiamo anche i supporti in validation)
+    # (optional but informative: validation imbalance)
     y_val_frames = []
     for i in range(len(ds_val)):
         _, y = ds_val[i]
@@ -459,14 +440,15 @@ def main():
     neg_val = int((y_val_frames <= 0.5).sum())
     tqdm.write(f"VAL frames -> pos: {pos_val}, neg: {neg_val}")
 
-    batch_size = 2048  # modifica se hai più/meno VRAM
+    # 6) DataLoaders: tune batch_size depending on your VRAM
+    batch_size = 2048  # increase if VRAM allows, decrease if OOM
     num_workers = min(12, os.cpu_count() or 4)
     train_loader = DataLoader(
         ds_train,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         persistent_workers=True,
         prefetch_factor=4,
     )
@@ -475,15 +457,25 @@ def main():
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         persistent_workers=True,
         prefetch_factor=4,
     )
 
-    # 6) Model / loss / optimizer / scheduler
-    model = SimpleMLP(in_features=n_features, hidden_sizes=(256, 128), dropout=0.2).to(
-        device
+    # 7) Model / loss / optimizer / scheduler
+    model = CNN1D(
+        in_channels=n_features,
+        base_channels=64,
+        dropout=0.2,
+        return_frame_logits=False,  # we only need sequence logits here; internally it still uses frame conv
     )
+
+    # Use multiple GPUs if available (simple DataParallel)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+
+    model = model.to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
@@ -491,17 +483,20 @@ def main():
         optimizer, mode="min", factor=0.5, patience=3
     )
 
-    amp_scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    amp_scaler = GradScaler(enabled=(device.type == "cuda"))
 
-    # 7) Training loop
+    # 8) Training loop
     num_epochs = 30
     best_val = -1.0
     best_ckpt = artifacts / "best_model.pt"
     history = []
 
     for epoch in range(1, num_epochs + 1):
+        # Clear terminal at each epoch to keep output clean
+        os.system("cls" if os.name == "nt" else "clear")
+
         t0 = time.time()
-        tqdm.write(f"\nEpoch {epoch}/{num_epochs}")
+        tqdm.write(f"Epoch {epoch}/{num_epochs}")
 
         tr = train_one_epoch(model, train_loader, criterion, optimizer, device, amp_scaler)
         ev = eval_epoch(model, val_loader, criterion, device)
@@ -546,7 +541,7 @@ def main():
             f"time={entry['epoch_time_sec']:.1f}s"
         )
 
-        # Model selection: prefer AUPRC con fallback a best F1
+        # Model selection: prefer AUPRC with fallback on best F1
         auprc = 0.0 if math.isnan(ev["auprc"]) else ev["auprc"]
         score = 0.7 * auprc + 0.3 * ev["best_f1"]
         if score > best_val:
@@ -568,7 +563,7 @@ def main():
         with open(artifacts / "training_log.json", "w") as f:
             json.dump(history, f, indent=2)
 
-    # 8) Save final weights as well
+    # 9) Save final weights as well
     torch.save(model.state_dict(), artifacts / "last_model_weights.pt")
     tqdm.write("\nTraining finished.")
     tqdm.write(f"- Best model: {best_ckpt}")

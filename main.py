@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import json
 import math
@@ -8,6 +5,7 @@ import time
 import random
 from pathlib import Path
 from typing import List, Tuple, Dict
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -15,7 +13,9 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -27,14 +27,13 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupShuffleSplit
 
-# --- import your model ---
+# Model import
 from models.cnn_1d import RoADCNN1D as CNN1D
 
 
-# -------------------------
-# Reproducibility helpers
-# -------------------------
+# Seed for reproducibility
 def seed_everything(seed: int = 42):
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -43,9 +42,7 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-# -------------------------
-# Data loading utilities
-# -------------------------
+# Dataloading 
 def list_csv_files(root: Path) -> List[Path]:
     """Recursively list all CSV files under root (data/dataset/<subset>/*.csv)."""
     return sorted(root.rglob("*.csv"))
@@ -70,7 +67,7 @@ def read_csv_return_features_labels(
         y = (y_raw > 0.5).astype(np.float32)
     else:
         feature_cols = cols
-        y = np.zeros(len(df), dtype=np.float32)
+        y = np.zeros(len(df), dtype = np.float32)
 
     X = df[feature_cols].values.astype(np.float32)
     return X, y, feature_cols
@@ -80,39 +77,35 @@ def fit_scaler_on_train_files(
     train_files: List[Path], feature_cols_ref: List[str], label_col: str = "anomaly"
 ) -> StandardScaler:
     """
-    Fit StandardScaler on TRAIN files only (concatenate along time),
+    Fit a StandardScaler on TRAIN files only (concatenate along time),
     only on features (no label).
     """
-    scaler = StandardScaler(with_mean=True, with_std=True)
+    scaler = StandardScaler(with_mean = True, with_std = True)
     chunks = []
     for f in tqdm(train_files, desc="Fitting scaler on train"):
-        X, _, feat_cols = read_csv_return_features_labels(f, label_col=label_col)
+        X, _, feat_cols = read_csv_return_features_labels(f, label_col = label_col)
         assert (
             feat_cols == feature_cols_ref
         ), f"Feature columns mismatch in {f.name}"
         chunks.append(X)
-    X_all = np.concatenate(chunks, axis=0)
+    X_all = np.concatenate(chunks, axis = 0)
     scaler.fit(X_all)
     return scaler
 
 
 def apply_scaler(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+    """Apply a fitted StandardScaler to a feature matrix."""
     return scaler.transform(X)
 
 
-# -------------------------
-# Windowed Dataset (with RAM cache)
-# -------------------------
+# Windowed Dataset
 class WindowedSeqDataset(Dataset):
     """
     Convert per-file time series into overlapping windows (C, T) plus a window label.
 
-    Label policy (NUOVA):
-      - Calcola la percentuale di frame anomali nella finestra.
-      - window_label = 1 se percentuale >= min_anomaly_ratio, altrimenti 0.
-      - Se il file non ha etichette, la finestra è 0 (normale).
-
-    Questo evita che una singola anomalia "contamini" centinaia di finestre.
+    Label policy (Option A):
+      - Window label = 1 if the window contains at least one anomalous frame.
+      - Otherwise, window label = 0.
     """
 
     def __init__(
@@ -123,7 +116,6 @@ class WindowedSeqDataset(Dataset):
         label_col: str = "anomaly",
         window_size: int = 128,
         step_size: int = 64,
-        min_anomaly_ratio: float = 0.2,
         progress_desc: str = "Indexing windows",
         cache_in_ram: bool = True,
     ):
@@ -133,23 +125,22 @@ class WindowedSeqDataset(Dataset):
         self.label_col = label_col
         self.window_size = window_size
         self.step_size = step_size
-        self.min_anomaly_ratio = min_anomaly_ratio
         self.cache_in_ram = cache_in_ram
 
-        self.index: List[Tuple[int, int, int]] = []  # (file_idx, start, end)
-        self._cache_meta: List[Tuple[int, int]] = []  # (n_frames, n_feats) per file
+        # index: (file_idx, start, end)
+        self.index: List[Tuple[int, int, int]] = []
+        self._cache_meta: List[Tuple[int, int]] = []  # (n_frames, n_feats)
         self._data_cache: Dict[Path, Tuple[np.ndarray, np.ndarray]] = {}
 
         total_windows = 0
-        for i, f in enumerate(tqdm(self.files, desc=progress_desc)):
+        for i, f in enumerate(tqdm(self.files, desc = progress_desc)):
             X, y, feat_cols = read_csv_return_features_labels(
-                f, label_col=self.label_col
+                f, label_col = self.label_col
             )
             assert (
                 feat_cols == self.feature_cols
             ), f"Feature columns mismatch in {f.name}"
 
-            # Pre-cache scaled data once per file (if enabled)
             if self.cache_in_ram:
                 X_scaled = apply_scaler(X, self.scaler)
                 self._data_cache[f] = (X_scaled, y)
@@ -168,7 +159,6 @@ class WindowedSeqDataset(Dataset):
         tqdm.write(
             f"{progress_desc}: indexed {total_windows} windows from {len(self.files)} files."
         )
-        # Group = file path
         self.groups = np.array(
             [self.files[i].as_posix() for (i, _, _) in self.index]
         )
@@ -193,95 +183,30 @@ class WindowedSeqDataset(Dataset):
         if len(y_full) >= e:
             yw = y_full[s:e]
         else:
-            yw = np.zeros(e - s, dtype=np.float32)
+            yw = np.zeros(e - s, dtype = np.float32)
 
-        # percentuale di frame anomali nella finestra
-        if len(yw) > 0:
-            anomaly_ratio = float(np.mean(yw > 0.5))
-        else:
-            anomaly_ratio = 0.0
+        # Option A: window is positive if it contains at least one positive frame.
+        label = float((yw > 0.5).any())
 
-        label = float(anomaly_ratio >= self.min_anomaly_ratio)
-
-        # (T, C) -> (C, T) per Conv1d
+        # (T, C) -> (C, T) for Conv1d
         Xw = torch.from_numpy(Xw.astype(np.float32)).permute(1, 0)
-        y = torch.tensor(label, dtype=torch.float32)
+        y = torch.tensor(label, dtype = torch.float32)
         return Xw, y
 
 
-# -------------------------
-# Training & evaluation
-# -------------------------
-def train_one_epoch(
-    model, loader, criterion, optimizer, device, amp_scaler
+# Helper for the metrics
+def _compute_full_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    mean_loss: float,
+    loss_class0: float,
+    loss_class1: float,
 ) -> Dict[str, float]:
-    model.train()
-    losses = []
-
-    for X, y in tqdm(loader, desc="Train", leave=False):
-        X = X.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            logits, _ = model(X)  # expects (B, 1)
-            logits = logits.squeeze(-1)  # (B,)
-            loss = criterion(logits, y)
-
-        amp_scaler.scale(loss).backward()
-        amp_scaler.step(optimizer)
-        amp_scaler.update()
-
-        losses.append(loss.item())
-
-    return {"loss": float(np.mean(losses)) if losses else float("nan")}
-
-
-@torch.no_grad()
-def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
-    model.eval()
-    losses = []
-    y_true_all, y_score_all = [], []
-
-    for X, y in tqdm(loader, desc="Val", leave=False):
-        X = X.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            logits, _ = model(X)
-            logits = logits.squeeze(-1)
-            loss = criterion(logits, y)
-
-        losses.append(loss.item())
-        probs = torch.sigmoid(logits).detach().cpu().numpy()
-        y_score_all.append(probs)
-        y_true_all.append(y.detach().cpu().numpy())
-
-    if not y_true_all:
-        return {
-            "loss": float("nan"),
-            "auroc": float("nan"),
-            "auprc": float("nan"),
-            "acc@0.5": float("nan"),
-            "prec@0.5": float("nan"),
-            "rec@0.5": float("nan"),
-            "f1@0.5": float("nan"),
-            "best_f1": float("nan"),
-            "best_th": 0.5,
-            "acc_class0": float("nan"),
-            "acc_class1": float("nan"),
-            "support_class0": 0,
-            "support_class1": 0,
-            "cm_tn": 0,
-            "cm_fp": 0,
-            "cm_fn": 0,
-            "cm_tp": 0,
-        }
-
-    y_true = np.concatenate(y_true_all)
-    y_score = np.concatenate(y_score_all)
-
-    # Best threshold (for info)
+    """
+    Compute all classification metrics plus class-wise losses, given
+    true labels and predicted probabilities.
+    """
+    # Best F1 threshold
     best_f1, best_th = -1.0, 0.5
     threshs = np.linspace(0.05, 0.95, 19)
     for th in threshs:
@@ -327,12 +252,13 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
 
     support_class0 = int(tn + fp)
     support_class1 = int(tp + fn)
-
     acc_class0 = float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
     acc_class1 = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
 
     return {
-        "loss": float(np.mean(losses)) if losses else float("nan"),
+        "loss": float(mean_loss),
+        "loss_class0": float(loss_class0),
+        "loss_class1": float(loss_class1),
         "auroc": auroc,
         "auprc": auprc,
         "acc@0.5": float(acc),
@@ -353,12 +279,221 @@ def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
 
 
 # -------------------------
+# Training & evaluation
+# -------------------------
+def train_one_epoch(
+    model, loader, criterion, optimizer, device, amp_scaler: GradScaler
+) -> Dict[str, float]:
+    """
+    Train the model for a single epoch and return full metrics
+    (loss, accuracy, precision, recall, F1, AUROC, AUPRC, confusion matrix,
+     per-class loss and per-class accuracy).
+    """
+    model.train()
+    losses = []
+    y_true_all, y_score_all = [], []
+
+    class0_loss_sum = 0.0
+    class1_loss_sum = 0.0
+    class0_count = 0
+    class1_count = 0
+
+    is_cuda = device.type == "cuda"
+    pos_weight = getattr(criterion, "pos_weight", None)
+
+    for X, y in tqdm(loader, desc="Train", leave=False):
+        X = X.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            if is_cuda
+            else nullcontext()
+        )
+
+        with ctx:
+            logits, _ = model(X)         # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
+            loss = criterion(logits, y)
+
+        amp_scaler.scale(loss).backward()
+        amp_scaler.step(optimizer)
+        amp_scaler.update()
+
+        losses.append(loss.item())
+
+        # Metrics: probs and labels
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        y_true_all.append(y.detach().cpu().numpy())
+        y_score_all.append(probs)
+
+        # Per-class loss (same BCE with logits but no reduction)
+        per_elem_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            y,
+            pos_weight=pos_weight,
+            reduction="none",
+        )
+
+        mask0 = (y == 0)
+        mask1 = (y == 1)
+        if mask0.any():
+            class0_loss_sum += per_elem_loss[mask0].sum().item()
+            class0_count += mask0.sum().item()
+        if mask1.any():
+            class1_loss_sum += per_elem_loss[mask1].sum().item()
+            class1_count += mask1.sum().item()
+
+    if not y_true_all:
+        return {
+            "loss": float("nan"),
+            "loss_class0": float("nan"),
+            "loss_class1": float("nan"),
+            "auroc": float("nan"),
+            "auprc": float("nan"),
+            "acc@0.5": float("nan"),
+            "prec@0.5": float("nan"),
+            "rec@0.5": float("nan"),
+            "f1@0.5": float("nan"),
+            "best_f1": float("nan"),
+            "best_th": 0.5,
+            "acc_class0": float("nan"),
+            "acc_class1": float("nan"),
+            "support_class0": 0,
+            "support_class1": 0,
+            "cm_tn": 0,
+            "cm_fp": 0,
+            "cm_fn": 0,
+            "cm_tp": 0,
+        }
+
+    y_true = np.concatenate(y_true_all)
+    y_score = np.concatenate(y_score_all)
+
+    mean_loss = float(np.mean(losses)) if losses else float("nan")
+    loss_class0 = (
+        class0_loss_sum / class0_count if class0_count > 0 else float("nan")
+    )
+    loss_class1 = (
+        class1_loss_sum / class1_count if class1_count > 0 else float("nan")
+    )
+
+    return _compute_full_metrics(
+        y_true=y_true,
+        y_score=y_score,
+        mean_loss=mean_loss,
+        loss_class0=loss_class0,
+        loss_class1=loss_class1,
+    )
+
+
+@torch.no_grad()
+def eval_epoch(model, loader, criterion, device) -> Dict[str, float]:
+    """
+    Evaluate the model on a validation loader and return the same
+    set of metrics as train_one_epoch.
+    """
+    model.eval()
+    losses = []
+    y_true_all, y_score_all = [], []
+
+    class0_loss_sum = 0.0
+    class1_loss_sum = 0.0
+    class0_count = 0
+    class1_count = 0
+
+    is_cuda = device.type == "cuda"
+    pos_weight = getattr(criterion, "pos_weight", None)
+
+    for X, y in tqdm(loader, desc="Val", leave=False):
+        X = X.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            if is_cuda
+            else nullcontext()
+        )
+
+        with ctx:
+            logits, _ = model(X)
+            logits = logits.squeeze(-1)
+            loss = criterion(logits, y)
+
+        losses.append(loss.item())
+
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        y_score_all.append(probs)
+        y_true_all.append(y.detach().cpu().numpy())
+
+        per_elem_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            y,
+            pos_weight=pos_weight,
+            reduction="none",
+        )
+
+        mask0 = (y == 0)
+        mask1 = (y == 1)
+        if mask0.any():
+            class0_loss_sum += per_elem_loss[mask0].sum().item()
+            class0_count += mask0.sum().item()
+        if mask1.any():
+            class1_loss_sum += per_elem_loss[mask1].sum().item()
+            class1_count += mask1.sum().item()
+
+    if not y_true_all:
+        return {
+            "loss": float("nan"),
+            "loss_class0": float("nan"),
+            "loss_class1": float("nan"),
+            "auroc": float("nan"),
+            "auprc": float("nan"),
+            "acc@0.5": float("nan"),
+            "prec@0.5": float("nan"),
+            "rec@0.5": float("nan"),
+            "f1@0.5": float("nan"),
+            "best_f1": float("nan"),
+            "best_th": 0.5,
+            "acc_class0": float("nan"),
+            "acc_class1": float("nan"),
+            "support_class0": 0,
+            "support_class1": 0,
+            "cm_tn": 0,
+            "cm_fp": 0,
+            "cm_fn": 0,
+            "cm_tp": 0,
+        }
+
+    y_true = np.concatenate(y_true_all)
+    y_score = np.concatenate(y_score_all)
+
+    mean_loss = float(np.mean(losses)) if losses else float("nan")
+    loss_class0 = (
+        class0_loss_sum / class0_count if class0_count > 0 else float("nan")
+    )
+    loss_class1 = (
+        class1_loss_sum / class1_count if class1_count > 0 else float("nan")
+    )
+
+    return _compute_full_metrics(
+        y_true=y_true,
+        y_score=y_score,
+        mean_loss=mean_loss,
+        loss_class0=loss_class0,
+        loss_class1=loss_class1,
+    )
+
+
+# -------------------------
 # Orchestration
 # -------------------------
 def main():
     seed_everything(42)
 
-    # GPU preferences
+    # GPU preferences: enable TF32 and fast kernels where possible
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.deterministic = False
@@ -371,14 +506,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        print(f"Using GPU: {gpu_name}")
+        print(f"Using GPU: {gpu_name} ({torch.cuda.device_count()} device(s))")
     else:
         print("Using CPU (no CUDA available)")
 
     data_root = Path("data/dataset")
     assert data_root.exists(), "data/dataset folder not found. Export CSVs first."
 
-    # 1) Discover files and reference feature order from FIRST file
+    # 1) Discover files and reference feature order from first file
     all_csv = list_csv_files(data_root)
     assert len(all_csv) > 0, "No CSV found under data/dataset/"
     X0, _, feature_cols = read_csv_return_features_labels(
@@ -420,10 +555,9 @@ def main():
     )
     tqdm.write("Scaler saved to artifacts/scaler.joblib")
 
-    # 4) Build datasets / loaders (windowed) — caching ON
+    # 4) Build datasets / loaders (windowed, Option A)
     window_size = 128
     step_size = 64
-    min_anomaly_ratio = 0.2  # almeno il 20% di frame anomali nella finestra
     batch_size = 256
 
     ds_train = WindowedSeqDataset(
@@ -433,7 +567,6 @@ def main():
         label_col="anomaly",
         window_size=window_size,
         step_size=step_size,
-        min_anomaly_ratio=min_anomaly_ratio,
         progress_desc="Indexing windows (train)",
         cache_in_ram=True,
     )
@@ -444,7 +577,6 @@ def main():
         label_col="anomaly",
         window_size=window_size,
         step_size=step_size,
-        min_anomaly_ratio=min_anomaly_ratio,
         progress_desc="Indexing windows (val)",
         cache_in_ram=True,
     )
@@ -465,28 +597,47 @@ def main():
         f"neg: {int(n_neg)}, pos_weight: {pos_weight.item():.2f}"
     )
 
+    # (Optional but informative) check validation imbalance
+    y_val_windows = []
+    for i in range(len(ds_val)):
+        _, y = ds_val[i]
+        y_val_windows.append(float(y.item()))
+    y_val_windows = np.array(y_val_windows)
+    pos_val = int((y_val_windows > 0.5).sum())
+    neg_val = int((y_val_windows <= 0.5).sum())
+    tqdm.write(f"VAL windows -> pos: {pos_val}, neg: {neg_val}")
+
     num_workers = min(12, os.cpu_count() or 4)
+    pin_memory = device.type == "cuda"
+
     train_loader = DataLoader(
         ds_train,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         ds_val,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     # 6) Model / loss / optimizer / scheduler
-    model = CNN1D(in_channels=n_features, base_channels=64, dropout=0.2).to(device)
+    model = CNN1D(in_channels=n_features, base_channels=64, dropout=0.2)
+
+    # Use multiple GPUs if available (simple DataParallel)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+
+    model = model.to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
@@ -494,7 +645,7 @@ def main():
         optimizer, mode="min", factor=0.5, patience=3
     )
 
-    amp_scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    amp_scaler = GradScaler(enabled=(device.type == "cuda"))
 
     # 7) Training loop
     num_epochs = 30
@@ -503,8 +654,10 @@ def main():
     history = []
 
     for epoch in range(1, num_epochs + 1):
+        os.system("cls" if os.name == "nt" else "clear")
+
         t0 = time.time()
-        tqdm.write(f"\nEpoch {epoch}/{num_epochs}")
+        tqdm.write(f"Epoch {epoch}/{num_epochs}")
 
         tr = train_one_epoch(model, train_loader, criterion, optimizer, device, amp_scaler)
         ev = eval_epoch(model, val_loader, criterion, device)
@@ -513,8 +666,32 @@ def main():
 
         entry = {
             "epoch": epoch,
+
+            # --- TRAIN METRICS ---
             "train_loss": tr["loss"],
+            "train_loss_class0": tr["loss_class0"],
+            "train_loss_class1": tr["loss_class1"],
+            "train_auroc": tr["auroc"],
+            "train_auprc": tr["auprc"],
+            "train_acc@0.5": tr["acc@0.5"],
+            "train_prec@0.5": tr["prec@0.5"],
+            "train_rec@0.5": tr["rec@0.5"],
+            "train_f1@0.5": tr["f1@0.5"],
+            "train_best_f1": tr["best_f1"],
+            "train_best_th": tr["best_th"],
+            "train_acc_class0": tr["acc_class0"],
+            "train_acc_class1": tr["acc_class1"],
+            "train_support_class0": tr["support_class0"],
+            "train_support_class1": tr["support_class1"],
+            "train_tn": tr["cm_tn"],
+            "train_fp": tr["cm_fp"],
+            "train_fn": tr["cm_fn"],
+            "train_tp": tr["cm_tp"],
+
+            # --- VAL METRICS ---
             "val_loss": ev["loss"],
+            "val_loss_class0": ev["loss_class0"],
+            "val_loss_class1": ev["loss_class1"],
             "val_auroc": ev["auroc"],
             "val_auprc": ev["auprc"],
             "val_acc@0.5": ev["acc@0.5"],
@@ -531,6 +708,7 @@ def main():
             "val_fp": ev["cm_fp"],
             "val_fn": ev["cm_fn"],
             "val_tp": ev["cm_tp"],
+
             "lr": optimizer.param_groups[0]["lr"],
             "epoch_time_sec": round(time.time() - t0, 2),
         }
@@ -540,16 +718,15 @@ def main():
             f"[Epoch {epoch:02d}] "
             f"train_loss={entry['train_loss']:.4f} "
             f"val_loss={entry['val_loss']:.4f} "
-            f"auprc={entry['val_auprc']:.4f} "
-            f"f1@0.5={entry['val_f1@0.5']:.4f} "
-            f"best_f1={entry['val_best_f1']:.4f} th*={entry['val_best_th']:.2f} "
-            f"acc0={entry['val_acc_class0']:.4f} "
-            f"acc1={entry['val_acc_class1']:.4f} "
+            f"train_acc={entry['train_acc@0.5']:.4f} "
+            f"val_acc={entry['val_acc@0.5']:.4f} "
+            f"val_auprc={entry['val_auprc']:.4f} "
+            f"val_f1@0.5={entry['val_f1@0.5']:.4f} "
             f"lr={entry['lr']:.2e} "
             f"time={entry['epoch_time_sec']:.1f}s"
         )
 
-        # Model selection: prefer AUPRC (imbalance) with fallback to best F1
+        # Model selection: AUPRC (important with imbalance) + best F1
         auprc = 0.0 if math.isnan(ev["auprc"]) else ev["auprc"]
         score = 0.7 * auprc + 0.3 * ev["best_f1"]
         if score > best_val:
