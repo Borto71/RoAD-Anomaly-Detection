@@ -14,17 +14,17 @@ class RoADWindowedDataset(Dataset):
         self.num_features = num_features
         self.include_label = include_label
     
-        self.index_map = []
+        self.index_map = [] # list of (record_index, start_index) tuples
 
-        for rec_idx, arr in enumerate(records):
+        for rec_idx, arr in enumerate(records): # arr is ndarray of shape (N, C)
             N = arr.shape[0]
             for start in range(0, N - window_size + 1, stride):
                 self.index_map.append((rec_idx, start))
 
-    def __len__(self):
+    def __len__(self): 
         return len(self.index_map)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx): # returns a window
         rec_idx, start = self.index_map[idx]
         arr = self.records[rec_idx]
 
@@ -36,20 +36,20 @@ class RoADWindowedDataset(Dataset):
 
 
 def compute_minmax(train_records, num_features = 86):
-    # transform all in one big array
+    # transform all in one big array 
     arrays = [np.asarray(rec)[:, :num_features] for rec in train_records]
     big = np.concatenate(arrays, axis = 0)
 
-    feat_min = big.min(axis = 0)
-    feat_max = big.max(axis = 0)
+    feat_min = big.min(axis = 0) # feature-wise min
+    feat_max = big.max(axis = 0) # feature-wise max
 
     return feat_min.astype(np.float32), feat_max.astype(np.float32) # not including label 87 
 
-def minmax_scale(arr, min_vals, max_vals, eps = 1e-8):
+def minmax_scale(arr, min_vals, max_vals, eps = 1e-8): # scale to [-1, 1]
     arr = arr.astype(np.float32)
     num = arr - min_vals
     den = (max_vals - min_vals) + eps
-    return 2.0 * (num / den) - 1.0
+    return 2.0 * (num / den) - 1.0 # return scaled array
 
 
 def main():
@@ -63,10 +63,12 @@ def main():
 
     first = train_records[0]
     arr = np.asarray(first)
-
+    # print the shape
+    
     print("Shape of first training record:", arr.shape) # (N, C)
     print("Feature number", arr.shape[1])
 
+    # Compute global min/max for normalization
     print("Computing global min/max over the training set...")
     feat_min, feat_max = compute_minmax(train_records, num_features = 86)
     train_norm = [
@@ -74,12 +76,15 @@ def main():
     for rec in train_records
     ]
 
+    # Show some stats
     print("Global feature-wise min (first 5 features):", feat_min[:5])
     print("Global feature-wise max (first 5 features):", feat_max[:5])
 
+    # Create windowed dataset
     dataset = RoADWindowedDataset(train_norm, window_size = 256, stride = 128)
     print("Total windows:", len(dataset))
 
+    # Get a sample for testing
     sample = dataset[0]
     print("Sample shape:", sample.shape)
 
