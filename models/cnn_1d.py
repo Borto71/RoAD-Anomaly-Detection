@@ -160,15 +160,6 @@ class RoADCNN1D(nn.Module):
         - frame_logits: shape (B, 1, T), per-timestep logits.
           If `return_frame_logits=False`, this may be returned as None to
           save memory at inference time.
-
-    Design choices for frame-level supervision:
-        - No temporal downsampling (stride = 1), so that each output time
-          index can be directly aligned with a frame-level label.
-        - Dilated convolutions in deeper stages to enlarge the receptive
-          field without losing temporal resolution.
-        - Sequence-level score computed from frame_logits instead of a
-          separate global head, so that both levels (frame & sequence)
-          are consistent.
     """
     def __init__(
         self,
