@@ -322,7 +322,6 @@ def main():
     print("Center c shape", c.shape)
 
     # Training Loop Deep SVDD
-
     num_epochs = 50
     for epoch in range(1, num_epochs + 1):
         avg_loss, n_batches, n_samples = train_one_epoch(model, train_loader, optimizer, c, device)
@@ -332,6 +331,73 @@ def main():
             f"- batches: {n_batches} "
             f"- samples: {n_samples}"
         )
+
+
+    # Evaluation scenario: COLLISION
+    print("\nEvaluation scenario: COLLISION")
+
+    coll_scores, coll_labels = collect_scores_and_labels(model, collision_loader, c, device)
+
+    if coll_scores is not None:
+        auc_roc_coll = roc_auc_score(coll_labels, coll_scores)
+        auc_pr_coll = average_precision_score(coll_labels, coll_scores)
+
+        print(f"Collision - ROC-AUC: {auc_roc_coll:.4f}")
+        print(f"Collision - PR-AUC : {auc_pr_coll:.4f}")
+    else:
+        print("No collision data available for evaluation.")
+
+
+    # Evaluation scenario: WEIGHT vs CONTROL
+    print("\nEvaluating scenario: WEIGHT vs CONTROL")
+
+    weight_scores, weight_labels = collect_scores_and_labels(
+        model, weight_loader, c, device
+    )
+    control_scores, control_labels = collect_scores_and_labels(
+        model, control_loader, c, device
+    )
+
+    if weight_scores is not None and control_scores is not None:
+        y_weight  = np.ones_like(weight_scores)   # all anomalies
+        y_control = np.zeros_like(control_scores) # all normal
+
+        scores_wc = np.concatenate([weight_scores, control_scores], axis = 0)
+        labels_wc = np.concatenate([y_weight, y_control], axis = 0)
+
+        auc_roc_weight = roc_auc_score(labels_wc, scores_wc)
+        auc_pr_weight  = average_precision_score(labels_wc, scores_wc)
+
+        print(f"Weight vs Control - ROC-AUC: {auc_roc_weight:.4f}")
+        print(f"Weight vs Control - PR-AUC : {auc_pr_weight:.4f}")
+    else:
+        print("Not enough data for WEIGHT vs CONTROL evaluation.")
+
+
+    # Evaluation scenario: VELOCITY vs CONTROL
+        print("\nEvaluating scenario: VELOCITY vs CONTROL")
+
+    velocity_scores, velocity_labels = collect_scores_and_labels(
+        model, velocity_loader, c, device
+    )
+
+    if velocity_scores is not None and control_scores is not None:
+        y_velocity = np.ones_like(velocity_scores)
+        y_control  = np.zeros_like(control_scores)
+
+        scores_vc = np.concatenate([velocity_scores, control_scores], axis=0)
+        labels_vc = np.concatenate([y_velocity,     y_control],      axis=0)
+
+        auc_roc_velocity = roc_auc_score(labels_vc, scores_vc)
+        auc_pr_velocity  = average_precision_score(labels_vc, scores_vc)
+
+        print(f"Velocity vs Control - ROC-AUC: {auc_roc_velocity:.4f}")
+        print(f"Velocity vs Control - PR-AUC : {auc_pr_velocity:.4f}")
+    else:
+        print("Not enough data for VELOCITY vs CONTROL evaluation.")    
+
+    print("Normal scores mean:", coll_scores[coll_labels == 0].mean())
+    print("Anomal scores mean:", coll_scores[coll_labels == 1].mean())
 
 
 if __name__ == "__main__":
