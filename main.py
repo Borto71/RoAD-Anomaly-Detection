@@ -30,9 +30,15 @@ class RoADWindowedDataset(Dataset):
 
         window = arr[start:start + self.window_size, :self.num_features]
         window = window.T
+        x_tensor = torch.from_numpy(window.astype(np.float32))
 
-        return torch.from_numpy(window)
+        if not self.include_label:
+            return x_tensor
 
+        window_labels = arr[start:start + self.window_size, self.num_features]  # (T,)
+        label_value = 1.0 if window_labels.max() > 0 else 0.0
+        y_tensor = torch.tensor(label_value, dtype = torch.float32)
+        return x_tensor, y_tensor
 
 
 def compute_minmax(train_records, num_features = 86):
