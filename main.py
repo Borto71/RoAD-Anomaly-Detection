@@ -3,6 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch
 from models.cnn_1d import RoADCNN1D
+from models.cnn_1d import build_model
 
 class RoADWindowedDataset(Dataset):
     def __init__(self, records, window_size, stride, num_features = 86, include_label = False):
@@ -72,6 +73,112 @@ def normalize_records(records, feat_min, feat_max, num_features = 86):
 
         norm_recs.append(arr_scaled)
     return norm_recs
+
+def compute_center(train_loader, model, device):
+    """
+    Calculate the center c in the space of the embedding, 
+    c is calculate on all the window of the training set
+    """
+    model.eval()
+    n_samples = 0
+    c_sum = None
+
+    with torch.no_grad():
+        for batch in train_loader:
+            # batch = x, because in the training we don't have the "anomaly" label
+            x = batch.to(device)  # shape: (B, C, T)
+
+            # embedding in windows 
+            z = model.forward_features(x)  # shape: (B, F)
+
+            # storing the sum
+            if c_sum is None:
+                c_sum = z.sum(dim = 0)
+            else:
+                c_sum += z.sum(dim = 0)
+
+            n_samples += z.shape[0]
+
+    # global even
+    c = c_sum / n_samples
+    # we secure a clean tensor
+    c = c.detach().to(device)
+    return c
+
+
+def train_one_epoch(model, train_loader, optimizer, c, device):
+    """
+    Execute one epoch training Deep SVDD, 
+    mimimize the distance of the embedding from the center c.
+    """
+    model.train()
+    running_loss = 0.0
+    n_batches = 0
+    n_samples = 0
+
+    for x in train_loader:
+        # x: (B, C, T)
+        x = x.to(device)
+
+        optimizer.zero_grad()
+
+        # 1) embedding of the window
+        z = model.forward_features(x)  # (B, F)
+
+        # 2) loss = even of the quadratic distance of c
+        # c: (F,)
+        dist_sq = (z - c)**2          # (B, F)
+        loss = dist_sq.sum(dim = 1).mean()  # scalar
+
+        # 3) backprop
+        loss.backward()
+        optimizer.step()
+
+        # intermediate log
+        batch_size = x.shape[0]
+        running_loss += loss.item()
+        n_batches += 1
+        n_samples += batch_size
+
+    avg_loss = running_loss / max(1, n_batches)
+    return avg_loss, n_batches, n_samples
+
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+def collect_scores_and_labels(model, loader, c, device):
+    """
+   Pass all the batch of the loader in the model, elaborate:
+   - anomaly score = quadratic distance from c
+   - label of the window 
+   Return two numpy arrays: scores, labels
+    """
+    model.eval()
+    all_scores = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            # here the loader test give (x, y)
+            x, y = batch
+            x = x.to(device)
+
+            # embedding
+            z = model.forward_features(x)  # (B, F)
+
+            # score = quadratic distance from the center
+            dist_sq = (z - c)**2          # (B, F)
+            scores = dist_sq.sum(dim = 1)   # (B,)
+
+            all_scores.append(scores.cpu().numpy())
+            all_labels.append(y.numpy())
+
+    if len(all_scores) == 0:
+        return None, None
+
+    scores = np.concatenate(all_scores, axis = 0)
+    labels = np.concatenate(all_labels, axis = 0)
+    return scores, labels
+
 
 
 def main():
@@ -184,8 +291,11 @@ def main():
 
     # Test DataLoaders
     collision_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+
     weight_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+
     velocity_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+
     control_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
 
     # Dictionary for dataloaders
@@ -195,6 +305,33 @@ def main():
         "velocity": velocity_loader,
         "control": control_loader,
     }
+
+    # Device & Model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # building the model
+    model = build_model(in_channels = 86, base_channels = 64, dropout = 0.1, return_frame_logits = False).to(device)
+
+    # Optimizer for Deep SVDD
+    optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4, weight_decay = 1e-6)
+
+    # Cumpute center c in feature space
+    print("Computing center c from training data embeddings...")
+    c = compute_center(train_loader, model, device)
+    print("Center c shape", c.shape)
+
+    # Training Loop Deep SVDD
+
+    num_epochs = 50
+    for epoch in range(1, num_epochs + 1):
+        avg_loss, n_batches, n_samples = train_one_epoch(model, train_loader, optimizer, c, device)
+        print(
+            f"Epoch {epoch:03d}/{num_epochs} "
+            f"- loss: {avg_loss:.6f} "
+            f"- batches: {n_batches} "
+            f"- samples: {n_samples}"
+        )
 
 
 if __name__ == "__main__":
