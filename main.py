@@ -1,10 +1,8 @@
 from RoADDataset import Dataset as RoADDataset
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch
-
-
-# from models.cnn_1d import CNN1D
+from models.cnn_1d import RoADCNN1D
 
 class RoADWindowedDataset(Dataset):
     def __init__(self, records, window_size, stride, num_features = 86, include_label = False):
@@ -76,67 +74,127 @@ def normalize_records(records, feat_min, feat_max, num_features = 86):
     return norm_recs
 
 
-
 def main():
     ds = RoADDataset(normalize = False)
 
-    print("Subsets available:", ds.sets.keys())
+    print("Subsets available:", ds.sets.keys()) # show the available subset for training and validation
 
+    # 1) Train subset, used only for training
     train_records = ds.sets["training"]
-    # assumo che esistano anche questi; se i nomi differiscono, li aggiusti:
-    val_records   = ds.sets.get("validation", [])
-    test_records  = ds.sets.get("test", [])
 
-    print(f"Number of training records: {len(train_records)}")
-    print(f"Number of validation records: {len(val_records)}")
-    print(f"Number of test records: {len(test_records)}")
+    # 2) Test set, subset of collision, weight, velocity and control
+    collision_records = ds.sets.get("collision", [])
+    weight_records    = ds.sets.get("weight",    [])
+    velocity_records  = ds.sets.get("velocity",  [])
+    control_records   = ds.sets.get("control",   [])
+
+    print(f"Number of training records:  {len(train_records)}")
+    print(f"Number of collision records: {len(collision_records)}")
+    print(f"Number of weight records:    {len(weight_records)}")
+    print(f"Number of velocity records:  {len(velocity_records)}")
+    print(f"Number of control records:   {len(control_records)}")
 
     first = train_records[0]
     arr = np.asarray(first)
     print("Shape of first training record:", arr.shape) # (N, C)
     print("Feature number", arr.shape[1])
 
-    # 1) Compute global min/max from TRAIN ONLY
+        # 1) Compute global min/max from TRAIN ONLY
     print("Computing global min/max over the training set...")
     feat_min, feat_max = compute_minmax(train_records, num_features = 86)
 
     # 2) Normalize all subsets using train stats
-    train_norm = normalize_records(train_records, feat_min, feat_max, num_features=86)
-    val_norm   = normalize_records(val_records,   feat_min, feat_max, num_features=86)
-    test_norm  = normalize_records(test_records,  feat_min, feat_max, num_features=86)
+    train_norm    = normalize_records(train_records,    feat_min, feat_max, num_features = 86)
+    collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features = 86)
+    weight_norm    = normalize_records(weight_records,    feat_min, feat_max, num_features = 86)
+    velocity_norm  = normalize_records(velocity_records,  feat_min, feat_max, num_features = 86)
+    control_norm   = normalize_records(control_records,   feat_min, feat_max, num_features = 86)
 
     # 3) Show some stats
     print("Global feature-wise min (first 5 features):", feat_min[:5])
     print("Global feature-wise max (first 5 features):", feat_max[:5])
 
-    # 4) Create windowed datasets (per ora solo train/val)
+        # 4) Create windowed datasets
+
+    # TRAIN: unsupervised, no label
     train_dataset = RoADWindowedDataset(
         train_norm,
         window_size = 256,
         stride = 128,
         num_features = 86,
-        include_label = False,   # unsupervised, no label in training
+        include_label = False,
     )
 
-    val_dataset = RoADWindowedDataset(
-        val_norm,
+    # TEST SCENARIOS: here we have the label
+    collision_dataset = RoADWindowedDataset(
+        collision_norm,
         window_size = 256,
         stride = 128,
         num_features = 86,
-        include_label = True,    # on the val dataset we need the label
+        include_label = True,
+    )
+
+    weight_dataset = RoADWindowedDataset(
+        weight_norm,
+        window_size = 256,
+        stride = 128,
+        num_features = 86,
+        include_label = True,
+    )
+
+    velocity_dataset = RoADWindowedDataset(
+        velocity_norm,
+        window_size = 256,
+        stride = 128,
+        num_features = 86,
+        include_label = True,
+    )
+
+    control_dataset = RoADWindowedDataset(
+        control_norm,
+        window_size = 256,
+        stride = 128,
+        num_features = 86,
+        include_label = True,
     )
 
     print("Total train windows:", len(train_dataset))
-    print("Total val windows:", len(val_dataset))
+    print("Total collision windows:", len(collision_dataset))
+    print("Total weight windows:", len(weight_dataset))
+    print("Total velocity windows:", len(velocity_dataset))
+    print("Total control windows:", len(control_dataset))
 
-    # Check on the sample
-    x_train = train_dataset[0]              # only features
-    x_val, y_val = val_dataset[0]          # features + label windowed
-
+    # Check on a sample
+    x_train = train_dataset[0]
     print("Sample train window shape:", x_train.shape)  # (C, T)
-    print("Sample val window shape:", x_val.shape)      # (C, T)
-    print("Sample val window label:", y_val.item())
 
+    if len(collision_dataset) > 0:
+        x_col, y_col = collision_dataset[0]
+        print("Sample collision window shape:", x_col.shape)
+        print("Sample collision window label:", y_col.item())
+
+    # DataLoader Hyperparameters
+    batch_size_train = 128
+    batch_size_eval = 256
+    num_workers = 0
+    pin_memory = torch.cuda.is_available()
+
+    # Train Dataloaders
+    train_loader = DataLoader(train_dataset, batch_size = batch_size_train, shuffle = True, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+
+    # Test DataLoaders
+    collision_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    weight_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    velocity_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    control_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+
+    # Dictionary for dataloaders
+    test_loaders = { 
+        "collision": collision_loader,
+        "weight": weight_loader,
+        "velocity": velocity_loader,
+        "control": control_loader,
+    }
 
 
 if __name__ == "__main__":
