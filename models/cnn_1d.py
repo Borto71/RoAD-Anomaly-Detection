@@ -38,15 +38,15 @@ class ConvBlock(nn.Module):
         self.conv = nn.Conv1d(
             in_ch,
             out_ch,
-            kernel_size = k,
-            stride = s,
-            padding = padding,
-            dilation = dilation,
-            bias = False,
+            kernel_size=k,
+            stride=s,
+            padding=padding,
+            dilation=dilation,
+            bias=False,
         )
         self.bn = nn.BatchNorm1d(out_ch)
         self.act = nn.GELU()
-        self.drop = nn.Dropout(p = dropout)
+        self.drop = nn.Dropout(p=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -95,26 +95,26 @@ class ResidualBlock(nn.Module):
         self.conv1 = ConvBlock(
             in_ch,
             out_ch,
-            k = k,
-            s = s,
-            dilation = dilation,
-            dropout = dropout,
+            k=k,
+            s=s,
+            dilation=dilation,
+            dropout=dropout,
         )
         # Second conv keeps stride=1 so that only the first convolution
         # controls the potential downsampling.
         self.conv2 = ConvBlock(
             out_ch,
             out_ch,
-            k = k,
-            s = 1,
-            dilation = dilation,
-            dropout = dropout,
+            k=k,
+            s=1,
+            dilation=dilation,
+            dropout=dropout,
         )
 
         # Optional shortcut to match (C, T) shape.
         if s != 1 or in_ch != out_ch:
             self.shortcut = nn.Sequential(
-                nn.Conv1d(in_ch, out_ch, kernel_size = 1, stride = s, bias = False),
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=s, bias=False),
                 nn.BatchNorm1d(out_ch),
             )
         else:
@@ -143,7 +143,7 @@ class RoADCNN1D(nn.Module):
     """
     CNN-1D model for anomaly detection on multi-variate time series.
 
-    This version is optimized for **frame-level** training:
+    Base design:
     - The network preserves the temporal resolution (same T) throughout.
     - A 1x1 convolution produces per-timestep logits (frame_logits).
     - The sequence-level logit is derived from frame_logits using a pooling
@@ -154,12 +154,13 @@ class RoADCNN1D(nn.Module):
            B = batch size, C = feature channels (e.g., 86), T = timesteps.
 
     Outputs:
-        A tuple (seq_logit, frame_logits) where:
-        - seq_logit: shape (B, 1), sequence-level anomaly score (raw logit).
-                     This is obtained by pooling frame_logits along time.
-        - frame_logits: shape (B, 1, T), per-timestep logits.
-          If `return_frame_logits=False`, this may be returned as None to
-          save memory at inference time.
+        Forward (supervised-style):
+            (seq_logit, frame_logits)
+            - seq_logit: shape (B, 1), sequence-level anomaly score (raw logit).
+            - frame_logits: shape (B, 1, T), per-timestep logits (or None).
+
+        forward_features (unsupervised-style):
+            z of shape (B, F), embedding per finestra per metodi tipo Deep SVDD.
     """
     def __init__(
         self,
@@ -175,14 +176,14 @@ class RoADCNN1D(nn.Module):
         self.seq_pooling = seq_pooling
         self.topk_ratio = topk_ratio
 
-        # Feature extractor: 4 stages of residual blocks with increasing
+        # Feature extractor: 4 stages of residual blocks with increasing capacity
         self.stem = ConvBlock(
             in_channels,
             base_channels,
-            k = 7,
-            s = 1,
-            dilation = 1,
-            dropout = dropout,
+            k=7,
+            s=1,
+            dilation=1,
+            dropout=dropout,
         )
 
         # Stage 1: no dilation, still local.
@@ -232,14 +233,39 @@ class RoADCNN1D(nn.Module):
         self.frame_head = nn.Conv1d(
             feat_dim,
             1,
-            kernel_size = 1,
-            stride = 1,
-            padding = 0,
+            kernel_size=1,
+            stride=1,
+            padding=0,
         )
 
+    # Feature extraction utilities
+    def _extract_feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Passa l'input attraverso stem + stage1..4 e ritorna il feature map (B, F, T).
+        """
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)   # (B, F, T)
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Estrae un embedding di finestra di shape (B, F) per metodi unsupervised
+        tipo Deep SVDD.
+
+        - x: (B, C_in, T)
+        - ritorno: (B, F) dove F = base_channels * 4
+        """
+        feat = self._extract_feature_map(x)   # (B, F, T)
+        z = feat.mean(dim=-1)                # global average pooling su T -> (B, F)
+        return z
+
+    # Forward 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Forward pass.
+        Forward pass (supervised-style).
 
         Args:
             x: tensor of shape (B, C, T)
@@ -250,19 +276,13 @@ class RoADCNN1D(nn.Module):
                           return_frame_logits=False and you wish to save memory.
         """
         # Feature extractor
-        x = self.stem(x)
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)       # (B, F, T), temporal length preserved
+        x = self._extract_feature_map(x)      # (B, F, T)
 
         # Frame-level logits: per-timestep anomaly score.
-        frame_logits = self.frame_head(x)  # (B, 1, T)
+        frame_logits = self.frame_head(x)     # (B, 1, T)
 
         # ----- Sequence-level pooling from frame_logits -----
-        # We pool over the temporal dimension to obtain a single score per window.
-        # This makes the sequence-level decision directly consistent with the
-        # frame-level scores.
+        # Pool over the temporal dimension to obtain a single score per window.
         if self.seq_pooling == "avg":
             # Simple average over time.
             seq_logit = frame_logits.mean(dim=-1)  # (B, 1)
@@ -272,11 +292,8 @@ class RoADCNN1D(nn.Module):
         else:
             # Top-k pooling (default):
             # take the mean over the k most anomalous timesteps.
-            # This is more robust than a pure max, while still focusing
-            # on the "peaks" of anomaly.
             B, C, T = frame_logits.shape
             k = max(1, int(self.topk_ratio * T))
-            # If topk_ratio is very small and T is small, k may fall back to 1.
             topk_vals, _ = torch.topk(frame_logits, k=k, dim=-1)
             seq_logit = topk_vals.mean(dim=-1)  # (B, 1)
 
@@ -303,8 +320,8 @@ def build_model(
         model = build_model(in_channels=86, base_channels=64, dropout=0.1)
     """
     return RoADCNN1D(
-        in_channels = in_channels,
-        base_channels = base_channels,
-        dropout = dropout,
-        return_frame_logits = return_frame_logits,
+        in_channels=in_channels,
+        base_channels=base_channels,
+        dropout=dropout,
+        return_frame_logits=return_frame_logits,
     )
