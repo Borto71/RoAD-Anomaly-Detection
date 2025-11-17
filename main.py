@@ -187,13 +187,16 @@ def main():
     print("Subsets available:", ds.sets.keys()) # show the available subset for training and validation
 
     # 1) Train subset, used only for training
-    train_records = ds.sets["training"]
+    base_train_records = ds.sets["training"]
+    control_records = ds.sets.get("control", [])
+
+    # Combined training = training + control
+    train_records = list(base_train_records) + list(control_records)
 
     # 2) Test set, subset of collision, weight, velocity and control
     collision_records = ds.sets.get("collision", [])
     weight_records    = ds.sets.get("weight",    [])
     velocity_records  = ds.sets.get("velocity",  [])
-    control_records   = ds.sets.get("control",   [])
 
     print(f"Number of training records:  {len(train_records)}")
     print(f"Number of collision records: {len(collision_records)}")
@@ -290,13 +293,41 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size = batch_size_train, shuffle = True, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
 
     # Test DataLoaders
-    collision_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    collision_loader = DataLoader(
+        collision_dataset,
+        batch_size = batch_size_eval,
+        shuffle = False,
+        drop_last = False,
+        num_workers = num_workers,
+        pin_memory = pin_memory,
+    )
 
-    weight_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    weight_loader = DataLoader(
+        weight_dataset,
+        batch_size = batch_size_eval,
+        shuffle = False,
+        drop_last = False,
+        num_workers = num_workers,
+        pin_memory = pin_memory,
+    )
 
-    velocity_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    velocity_loader = DataLoader(
+        velocity_dataset,
+        batch_size = batch_size_eval,
+        shuffle = False,
+        drop_last = False,
+        num_workers = num_workers,
+        pin_memory = pin_memory,
+    )
 
-    control_loader = DataLoader(collision_dataset, batch_size = batch_size_eval, shuffle = False, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
+    control_loader = DataLoader(
+        control_dataset,
+        batch_size = batch_size_eval,
+        shuffle = False,
+        drop_last = False,
+        num_workers = num_workers,
+        pin_memory = pin_memory,
+    )
 
     # Dictionary for dataloaders
     test_loaders = { 
@@ -337,6 +368,24 @@ def main():
     print("\nEvaluation scenario: COLLISION")
 
     coll_scores, coll_labels = collect_scores_and_labels(model, collision_loader, c, device)
+    print("Num normal windows:", (coll_labels == 0).sum())
+    print("Num anomal windows:", (coll_labels == 1).sum())
+    print("Normal scores mean:", coll_scores[coll_labels == 0].mean())
+    print("Anomal scores mean:", coll_scores[coll_labels == 1].mean())
+
+    # AUC "normal"
+    auc_roc_coll = roc_auc_score(coll_labels, coll_scores)
+    print(f"Collision - ROC-AUC (as is): {auc_roc_coll:.4f}")
+
+    # AUC con LABELS swapped
+    auc_roc_coll_inv_labels = roc_auc_score(1 - coll_labels, coll_scores)
+    print(f"Collision - ROC-AUC (labels flipped): {auc_roc_coll_inv_labels:.4f}")
+
+    # AUC con SCORE swappedS
+    auc_roc_coll_inv_scores = roc_auc_score(coll_labels, -coll_scores)
+    print(f"Collision - ROC-AUC (scores negated): {auc_roc_coll_inv_scores:.4f}")
+
+
 
     if coll_scores is not None:
         auc_roc_coll = roc_auc_score(coll_labels, coll_scores)
