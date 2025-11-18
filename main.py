@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from models.cnn_1d import RoADCNN1D
 from models.cnn_1d import build_model
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
+
 
 class RoADWindowedDataset(Dataset):
     def __init__(self, records, window_size, stride, num_features = 86, include_label = False):
@@ -143,7 +145,6 @@ def train_one_epoch(model, train_loader, optimizer, c, device):
     avg_loss = running_loss / max(1, n_batches)
     return avg_loss, n_batches, n_samples
 
-from sklearn.metrics import roc_auc_score, average_precision_score
 
 def collect_scores_and_labels(model, loader, c, device):
     """
@@ -179,6 +180,50 @@ def collect_scores_and_labels(model, loader, c, device):
     labels = np.concatenate(all_labels, axis = 0)
     return scores, labels
 
+def compute_metrics_from_scores(scores, labels):
+    # ROC-AUC e PR-AUC
+    roc_auc = roc_auc_score(labels, scores)
+    pr_auc = average_precision_score(labels, scores)
+
+    # Loss per class
+    if np.any(labels == 0):
+        mean_loss_normal = float(scores[labels == 0].mean())
+    else:
+        mean_loss_normal = None
+
+    if np.any(labels == 1):
+        mean_loss_anom = float(scores[labels == 1].mean())
+    else:
+        mean_loss_anom = None
+
+    # We need to found the maximum threshold that maximize F1
+    unique_scores = np.unique(scores)
+    best_f1 = -1.0
+    best_prec = 0.0
+    best_rec = 0.0
+    best_thr = None
+
+    for thr in unique_scores:
+        y_pred = (scores >= thr).astype(int)
+        prec, rec, f1, _ = precision_recall_fscore_support(labels, y_pred, average = 'binary', zero_division = 0)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_f1 = prec
+            best_rec = rec
+            best_thr = thr
+
+    metrics = {"roc_auc": float(roc_auc),
+        "pr_auc": float(pr_auc),
+        "mean_loss_normal": mean_loss_normal,
+        "mean_loss_anom": mean_loss_anom,
+        "best_threshold": float(best_thr) if best_thr is not None else None,
+        "precision": float(best_prec),
+        "recall": float(best_rec),
+        "f1": float(best_f1),
+        }
+    
+    return metrics
 
 
 def main():
@@ -363,72 +408,69 @@ def main():
             f"- samples: {n_samples}"
         )
 
-
     # Evaluation scenario: COLLISION
     print("\nEvaluation scenario: COLLISION")
 
-    coll_scores, coll_labels = collect_scores_and_labels(model, collision_loader, c, device)
-    print("Num normal windows:", (coll_labels == 0).sum())
-    print("Num anomal windows:", (coll_labels == 1).sum())
-    print("Normal scores mean:", coll_scores[coll_labels == 0].mean())
-    print("Anomal scores mean:", coll_scores[coll_labels == 1].mean())
-
-    # AUC "normal"
-    auc_roc_coll = roc_auc_score(coll_labels, coll_scores)
-    print(f"Collision - ROC-AUC (as is): {auc_roc_coll:.4f}")
-
-    # AUC con LABELS swapped
-    auc_roc_coll_inv_labels = roc_auc_score(1 - coll_labels, coll_scores)
-    print(f"Collision - ROC-AUC (labels flipped): {auc_roc_coll_inv_labels:.4f}")
-
-    # AUC con SCORE swappedS
-    auc_roc_coll_inv_scores = roc_auc_score(coll_labels, -coll_scores)
-    print(f"Collision - ROC-AUC (scores negated): {auc_roc_coll_inv_scores:.4f}")
-
-
+    coll_scores, coll_labels = collect_scores_and_labels(
+        model, collision_loader, c, device
+    )
 
     if coll_scores is not None:
-        auc_roc_coll = roc_auc_score(coll_labels, coll_scores)
-        auc_pr_coll = average_precision_score(coll_labels, coll_scores)
+        print("Num normal windows:", int((coll_labels == 0).sum()))
+        print("Num anomal windows:", int((coll_labels == 1).sum()))
 
-        print(f"Collision - ROC-AUC: {auc_roc_coll:.4f}")
-        print(f"Collision - PR-AUC : {auc_pr_coll:.4f}")
+        # metriche complete
+        coll_metrics = compute_metrics_from_scores(coll_scores, coll_labels)
+
+        print(f"Collision - ROC-AUC: {coll_metrics['roc_auc']:.4f}")
+        print(f"Collision - PR-AUC : {coll_metrics['pr_auc']:.4f}")
+        print(f"Collision - mean loss (normal): {coll_metrics['mean_loss_normal']}")
+        print(f"Collision - mean loss (anom)  : {coll_metrics['mean_loss_anom']}")
+        print(
+            f"Collision - best thr: {coll_metrics['best_threshold']:.4e} "
+            f"| P: {coll_metrics['precision']:.4f} "
+            f"R: {coll_metrics['recall']:.4f} "
+            f"F1: {coll_metrics['f1']:.4f}"
+        )
     else:
+        coll_metrics = None
         print("No collision data available for evaluation.")
 
 
-    # Evaluation scenario: WEIGHT vs CONTROL
     print("\nEvaluating scenario: WEIGHT vs CONTROL")
 
-    weight_scores, weight_labels = collect_scores_and_labels(
-        model, weight_loader, c, device
-    )
-    control_scores, control_labels = collect_scores_and_labels(
-        model, control_loader, c, device
-    )
+    weight_scores, _ = collect_scores_and_labels(model, weight_loader, c, device)
+    control_scores, _ = collect_scores_and_labels(model, control_loader, c, device)
 
     if weight_scores is not None and control_scores is not None:
-        y_weight  = np.ones_like(weight_scores)   # all anomalies
-        y_control = np.zeros_like(control_scores) # all normal
+        # definiamo noi le label binarie: weight=1 (anomalo), control=0 (normale)
+        y_weight  = np.ones_like(weight_scores)
+        y_control = np.zeros_like(control_scores)
 
-        scores_wc = np.concatenate([weight_scores, control_scores], axis = 0)
-        labels_wc = np.concatenate([y_weight, y_control], axis = 0)
+        scores_wc = np.concatenate([weight_scores, control_scores], axis=0)
+        labels_wc = np.concatenate([y_weight,     y_control],      axis=0)
 
-        auc_roc_weight = roc_auc_score(labels_wc, scores_wc)
-        auc_pr_weight  = average_precision_score(labels_wc, scores_wc)
+        weight_metrics = compute_metrics_from_scores(scores_wc, labels_wc)
 
-        print(f"Weight vs Control - ROC-AUC: {auc_roc_weight:.4f}")
-        print(f"Weight vs Control - PR-AUC : {auc_pr_weight:.4f}")
+        print(f"Weight vs Control - ROC-AUC: {weight_metrics['roc_auc']:.4f}")
+        print(f"Weight vs Control - PR-AUC : {weight_metrics['pr_auc']:.4f}")
+        print(f"Weight vs Control - mean loss (normal): {weight_metrics['mean_loss_normal']}")
+        print(f"Weight vs Control - mean loss (anom)  : {weight_metrics['mean_loss_anom']}")
+        print(
+            f"Weight vs Control - best thr: {weight_metrics['best_threshold']:.4e} "
+            f"| P: {weight_metrics['precision']:.4f} "
+            f"R: {weight_metrics['recall']:.4f} "
+            f"F1: {weight_metrics['f1']:.4f}"
+        )
     else:
+        weight_metrics = None
         print("Not enough data for WEIGHT vs CONTROL evaluation.")
 
-
     # Evaluation scenario: VELOCITY vs CONTROL
-        print("\nEvaluating scenario: VELOCITY vs CONTROL")
+    print("\nEvaluating scenario: VELOCITY vs CONTROL")
 
-    velocity_scores, velocity_labels = collect_scores_and_labels(
-        model, velocity_loader, c, device
-    )
+    velocity_scores, _ = collect_scores_and_labels(model, velocity_loader, c, device)
+    # control_scores alredy calculated
 
     if velocity_scores is not None and control_scores is not None:
         y_velocity = np.ones_like(velocity_scores)
@@ -437,16 +479,21 @@ def main():
         scores_vc = np.concatenate([velocity_scores, control_scores], axis=0)
         labels_vc = np.concatenate([y_velocity,     y_control],      axis=0)
 
-        auc_roc_velocity = roc_auc_score(labels_vc, scores_vc)
-        auc_pr_velocity  = average_precision_score(labels_vc, scores_vc)
+        velocity_metrics = compute_metrics_from_scores(scores_vc, labels_vc)
 
-        print(f"Velocity vs Control - ROC-AUC: {auc_roc_velocity:.4f}")
-        print(f"Velocity vs Control - PR-AUC : {auc_pr_velocity:.4f}")
+        print(f"Velocity vs Control - ROC-AUC: {velocity_metrics['roc_auc']:.4f}")
+        print(f"Velocity vs Control - PR-AUC : {velocity_metrics['pr_auc']:.4f}")
+        print(f"Velocity vs Control - mean loss (normal): {velocity_metrics['mean_loss_normal']}")
+        print(f"Velocity vs Control - mean loss (anom)  : {velocity_metrics['mean_loss_anom']}")
+        print(
+            f"Velocity vs Control - best thr: {velocity_metrics['best_threshold']:.4e} "
+            f"| P: {velocity_metrics['precision']:.4f} "
+            f"R: {velocity_metrics['recall']:.4f} "
+            f"F1: {velocity_metrics['f1']:.4f}"
+        )
     else:
-        print("Not enough data for VELOCITY vs CONTROL evaluation.")    
-
-    print("Normal scores mean:", coll_scores[coll_labels == 0].mean())
-    print("Anomal scores mean:", coll_scores[coll_labels == 1].mean())
+        velocity_metrics = None
+        print("Not enough data for VELOCITY vs CONTROL evaluation.")
 
 
 if __name__ == "__main__":
