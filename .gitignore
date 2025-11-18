@@ -1,7 +1,4 @@
 /data/dataset/
 /models/__pycache__/
 /models/cnn_1d.pyc
-/result/
-road_cnn.pt
-artifacts/
-artifacts_framelevel/
+/runs/

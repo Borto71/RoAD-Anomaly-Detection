@@ -509,7 +509,7 @@ def main():
 
     # Bild result dictionary
 
-        results = {
+    results = {
         "config": {
             "window_size": 256,
             "stride": 128,
@@ -530,7 +530,7 @@ def main():
     # Save metrics JSON
     metrics_path = os.path.join(run_dir, "metrics.json")
     with open(metrics_path, "w") as f:
-        json.dup(results, f, indent = 2)
+        json.dump(results, f, indent = 2)
 
     print(f"Saved metrics to {metrics_path}")
 
