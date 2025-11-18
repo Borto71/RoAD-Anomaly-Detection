@@ -5,7 +5,10 @@ import torch
 from models.cnn_1d import RoADCNN1D
 from models.cnn_1d import build_model
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
-
+import time
+import os
+import json
+import torch
 
 class RoADWindowedDataset(Dataset):
     def __init__(self, records, window_size, stride, num_features = 86, include_label = False):
@@ -227,6 +230,12 @@ def compute_metrics_from_scores(scores, labels):
 
 
 def main():
+    # Create unique run directory
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join("runs", f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok = True)
+    print(f"\nSaving outputs to: {run_dir}")
+
     ds = RoADDataset(normalize = False)
 
     print("Subsets available:", ds.sets.keys()) # show the available subset for training and validation
@@ -254,7 +263,7 @@ def main():
     print("Shape of first training record:", arr.shape) # (N, C)
     print("Feature number", arr.shape[1])
 
-        # 1) Compute global min/max from TRAIN ONLY
+    # 1) Compute global min/max from TRAIN ONLY
     print("Computing global min/max over the training set...")
     feat_min, feat_max = compute_minmax(train_records, num_features = 86)
 
@@ -399,6 +408,7 @@ def main():
 
     # Training Loop Deep SVDD
     num_epochs = 50
+    train_losses = []
     for epoch in range(1, num_epochs + 1):
         avg_loss, n_batches, n_samples = train_one_epoch(model, train_loader, optimizer, c, device)
         print(
@@ -407,6 +417,8 @@ def main():
             f"- batches: {n_batches} "
             f"- samples: {n_samples}"
         )
+
+        train_losses.append(avg_loss)
 
     # Evaluation scenario: COLLISION
     print("\nEvaluation scenario: COLLISION")
@@ -419,7 +431,7 @@ def main():
         print("Num normal windows:", int((coll_labels == 0).sum()))
         print("Num anomal windows:", int((coll_labels == 1).sum()))
 
-        # metriche complete
+        # full metrics
         coll_metrics = compute_metrics_from_scores(coll_scores, coll_labels)
 
         print(f"Collision - ROC-AUC: {coll_metrics['roc_auc']:.4f}")
@@ -494,6 +506,47 @@ def main():
     else:
         velocity_metrics = None
         print("Not enough data for VELOCITY vs CONTROL evaluation.")
+
+    # Bild result dictionary
+
+        results = {
+        "config": {
+            "window_size": 256,
+            "stride": 128,
+            "num_epochs": num_epochs,
+            "batch_size_train": batch_size_train,
+            "batch_size_eval": batch_size_eval,
+        },
+        "train": {
+            "loss_per_epoch": train_losses,
+            "num_train_windows": len(train_dataset),
+        },
+        "collision": coll_metrics,
+        "weight_vs_control": weight_metrics,
+        "velocity_vs_control": velocity_metrics,
+    }
+
+
+    # Save metrics JSON
+    metrics_path = os.path.join(run_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dup(results, f, indent = 2)
+
+    print(f"Saved metrics to {metrics_path}")
+
+    # Save model checkpoint
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "center_c": c.detach().cpu().numpy(),
+        "feat_min": feat_min,
+        "feat_max": feat_max,
+        "config": results["config"],
+    }
+
+    ckpt_path = os.path.join(run_dir, "model.pt")
+    torch.save(ckpt, ckpt_path)
+
+    print(f"Saved model checkpoint to {ckpt_path}")
 
 
 if __name__ == "__main__":
