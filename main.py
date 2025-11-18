@@ -184,11 +184,15 @@ def collect_scores_and_labels(model, loader, c, device):
     return scores, labels
 
 def compute_metrics_from_scores(scores, labels):
+    """
+    scores: numpy array (N,)  anomaly score 
+    labels: numpy array (N,)  0 = normal, 1 = anomaly
+    """
     # ROC-AUC e PR-AUC
     roc_auc = roc_auc_score(labels, scores)
     pr_auc = average_precision_score(labels, scores)
 
-    # Loss per class
+    # "loss per class" = even socre per class
     if np.any(labels == 0):
         mean_loss_normal = float(scores[labels == 0].mean())
     else:
@@ -199,24 +203,50 @@ def compute_metrics_from_scores(scores, labels):
     else:
         mean_loss_anom = None
 
-    # We need to found the maximum threshold that maximize F1
+    # threshold that maximize the F1
     unique_scores = np.unique(scores)
     best_f1 = -1.0
     best_prec = 0.0
     best_rec = 0.0
     best_thr = None
+    best_conf = None  # TP, FP, TN, FN at better threshold
 
     for thr in unique_scores:
         y_pred = (scores >= thr).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(labels, y_pred, average = 'binary', zero_division = 0)
-
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            labels, y_pred, average="binary", zero_division = 0
+        )
         if f1 > best_f1:
             best_f1 = f1
-            best_f1 = prec
+            best_prec = prec
             best_rec = rec
             best_thr = thr
 
-    metrics = {"roc_auc": float(roc_auc),
+            # confusion matrix per accuracy per class
+            tp = int(((labels == 1) & (y_pred == 1)).sum())
+            tn = int(((labels == 0) & (y_pred == 0)).sum())
+            fp = int(((labels == 0) & (y_pred == 1)).sum())
+            fn = int(((labels == 1) & (y_pred == 0)).sum())
+            best_conf = (tp, fp, tn, fn)
+
+    if best_conf is not None:
+        tp, fp, tn, fn = best_conf
+        total = tp + fp + tn + fn
+
+        acc_overall = (tp + tn) / total if total > 0 else None
+        # accuracy class normal = TN / (TN + FP)
+        den_normal = tn + fp
+        acc_normal = tn / den_normal if den_normal > 0 else None
+        # accuracy class anomaly = TP / (TP + FN) = recall
+        den_anom = tp + fn
+        acc_anom = tp / den_anom if den_anom > 0 else None
+    else:
+        acc_overall = None
+        acc_normal = None
+        acc_anom = None
+
+    metrics = {
+        "roc_auc": float(roc_auc),
         "pr_auc": float(pr_auc),
         "mean_loss_normal": mean_loss_normal,
         "mean_loss_anom": mean_loss_anom,
@@ -224,9 +254,12 @@ def compute_metrics_from_scores(scores, labels):
         "precision": float(best_prec),
         "recall": float(best_rec),
         "f1": float(best_f1),
-        }
-    
+        "acc_overall": acc_overall,
+        "acc_normal": acc_normal,
+        "acc_anom": acc_anom,
+    }
     return metrics
+
 
 
 def main():

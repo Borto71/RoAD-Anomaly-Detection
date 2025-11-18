@@ -133,6 +133,85 @@ def plot_f1_bars(data, run_dir):
     print(f"Saved F1 bar plot to {out_path}")
 
 
+def plot_class_loss(data, run_dir):
+    scenarios = ["collision", "weight_vs_control", "velocity_vs_control"]
+    scen_labels = ["Collision", "Weight vs Control", "Velocity vs Control"]
+
+    normal_losses = []
+    anom_losses = []
+
+    for s in scenarios:
+        metrics = data.get(s, None)
+        if metrics is None:
+            normal_losses.append(0.0)
+            anom_losses.append(0.0)
+        else:
+            ln = metrics.get("mean_loss_normal", None)
+            la = metrics.get("mean_loss_anom", None)
+            normal_losses.append(ln if ln is not None else 0.0)
+            anom_losses.append(la if la is not None else 0.0)
+
+    x = np.arange(len(scenarios))
+    width = 0.35
+
+    plt.figure()
+    plt.bar(x - width/2, normal_losses, width, label="Normal")
+    plt.bar(x + width/2, anom_losses,   width, label="Anomal")
+
+    plt.xticks(x, scen_labels, rotation=20)
+    plt.ylabel("Mean loss (score)")
+    plt.title("Mean loss per class and scenario")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.legend()
+
+
+    out_path = os.path.join(run_dir, "class_loss_bars.png")
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved per-class loss bar plot to {out_path}")
+
+def plot_class_accuracy(data, run_dir):
+    scenarios = ["collision", "weight_vs_control", "velocity_vs_control"]
+    scen_labels = ["Collision", "Weight vs Control", "Velocity vs Control"]
+
+    acc_normals = []
+    acc_anoms = []
+
+    for s in scenarios:
+        metrics = data.get(s, None)
+        if metrics is None:
+            acc_normals.append(0.0)
+            acc_anoms.append(0.0)
+        else:
+            an = metrics.get("acc_normal", None)
+            aa = metrics.get("acc_anom", None)
+            acc_normals.append(an if an is not None else 0.0)
+            acc_anoms.append(aa if aa is not None else 0.0)
+
+    x = np.arange(len(scenarios))
+    width = 0.35
+
+    plt.figure()
+    plt.bar(x - width/2, acc_normals, width, label="Normal")
+    plt.bar(x + width/2, acc_anoms,   width, label="Anomal")
+
+    plt.xticks(x, scen_labels, rotation=20)
+    plt.ylim(0.0, 1.0)
+    plt.ylabel("Accuracy")
+    plt.title("Per-class accuracy per scenario (best threshold)")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.legend()
+
+    for i, (n, a) in enumerate(zip(acc_normals, acc_anoms)):
+        plt.text(i - width/2, n + 0.02, f"{n:.2f}", ha="center", va="bottom", fontsize=8)
+        plt.text(i + width/2, a + 0.02, f"{a:.2f}", ha="center", va="bottom", fontsize=8)
+
+    out_path = os.path.join(run_dir, "class_accuracy_bars.png")
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved per-class accuracy bar plot to {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot RoAD anomaly detection results.")
     parser.add_argument(
@@ -157,6 +236,18 @@ def main():
     plot_train_loss(data, run_dir)
     plot_auc_bars(data, run_dir)
     plot_f1_bars(data, run_dir)
+
+    data = load_metrics(run_dir)
+
+    # Plots 
+    plot_train_loss(data, run_dir)
+    plot_auc_bars(data, run_dir)
+    plot_f1_bars(data, run_dir)
+
+    # New Plots per class
+    plot_class_loss(data, run_dir)
+    plot_class_accuracy(data, run_dir)
+
 
 
 if __name__ == "__main__":
