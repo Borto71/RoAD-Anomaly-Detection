@@ -60,7 +60,7 @@ def load_subset_df(meta: dict, subset_name: str, meta_path: Path) -> pd.DataFram
     if not dfs:
         raise ValueError(f"No CSV files found for subset '{subset_name}'")
 
-    df_all = pd.concat(dfs, ignore_index=True)
+    df_all = pd.concat(dfs, ignore_index = True)
     return df_all
 
 
@@ -178,7 +178,7 @@ def train_autogluon(df_all: pd.DataFrame, output_path: str = "AutogluonModels/ro
 
     # Show leaderboard of models
     print("\nLeaderboard:")
-    leaderboard = predictor.leaderboard(test_data, silent=True)
+    leaderboard = predictor.leaderboard(test_data, silent = True)
     print(leaderboard)
 
     return predictor, leaderboard
