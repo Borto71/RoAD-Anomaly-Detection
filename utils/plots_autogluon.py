@@ -1,7 +1,4 @@
-# plts_autogluon.py
-
 import os
-import json
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -29,7 +26,7 @@ def find_latest_run_dir(base_dir):
     run_dirs.sort(reverse=True)
     return run_dirs[0]
 
-def plot_learning_curves(ag_path, model_name, model_dir):
+def plot_learning_curves(model_name, model_dir):
     """
     Generates and saves the Learning Curve plot (Accuracy and Loss vs. Threshold) 
     for a specific model from its CSV file.
@@ -37,7 +34,7 @@ def plot_learning_curves(ag_path, model_name, model_dir):
     lc_path = os.path.join(model_dir, LC_CSV_NAME)
     
     if not os.path.exists(lc_path):
-        print(f"Warning: Learning curve CSV not found for model {model_name} at {lc_path}")
+        # Quietly return if file doesn't exist (avoids spam for non-model folders)
         return
 
     try:
@@ -62,73 +59,110 @@ def plot_learning_curves(ag_path, model_name, model_dir):
     ax2 = ax1.twinx()  
     color_loss = 'tab:red'
     ax2.set_ylabel('BCE Loss', color=color_loss)  
-    # Loss is constant across thresholds, but we plot it for completeness
+    
+    # Plot Loss
     ax2.plot(lc_df['threshold'], lc_df['loss'], color=color_loss, linestyle='--', label='BCE Loss')
     ax2.tick_params(axis='y', labelcolor=color_loss)
     
     fig.suptitle(f'Test Set: Accuracy and Loss vs. Threshold for {model_name}')
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to make room for suptitle
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95]) 
 
     # Save plot
     plot_path = os.path.join(model_dir, "learning_curve_test.png")
     plt.savefig(plot_path)
     plt.close(fig)
-    print(f"  -> Saved learning curve plot to {plot_path}")
+    # print(f"     Saved to {plot_path}")
+
+def plot_bar_metric(model_names, values, metric_name, color, run_dir, filename):
+    """
+    Helper function to plot a simple bar chart for a given metric.
+    """
+    if not values:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.bar(model_names, values, color=color)
+    
+    ax.set_ylabel(metric_name)
+    ax.set_xlabel('Model')
+    ax.set_title(f'Comparative {metric_name}')
+    
+    # Add labels on top of bars
+    for bar in bars:
+        yval = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, yval + 0.005, f"{yval:.4f}", ha='center', va='bottom', fontsize=9)
+        
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    plot_path = os.path.join(run_dir, filename)
+    plt.savefig(plot_path)
+    plt.close(fig)
+    print(f"Saved comparison plot for {metric_name} to {filename}")
 
 def plot_model_comparison(comp_df, run_dir):
     """
-    Generates and saves comparative bar plots for Class 0 and Class 1 Accuracy (at threshold 0.5).
+    Generates and saves comparative bar plots based on available columns in the CSV.
     """
     model_names = comp_df['model'].tolist()
     
-    # --- Accuracy Class 0 Comparison (Normal Samples) ---
-    acc_class0 = comp_df['accuracy_class0_at_0.5'].tolist()
+    # Check which columns are available and plot accordingly
     
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars = ax.bar(model_names, acc_class0, color='skyblue')
+    # 1. ROC AUC (Most important for Anomaly Detection)
+    if 'roc_auc' in comp_df.columns:
+        plot_bar_metric(
+            model_names, 
+            comp_df['roc_auc'].tolist(), 
+            "ROC AUC", 
+            "mediumpurple", 
+            run_dir, 
+            "comparison_roc_auc.png"
+        )
     
-    ax.set_ylabel('Accuracy (Class 0: Normal)')
-    ax.set_xlabel('Model')
-    ax.set_title('Comparative Accuracy on Normal Samples (Class 0) at Threshold 0.5')
-    
-    # Add labels on top of bars
-    for bar in bars:
-        yval = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, yval + 0.005, round(yval, 4), ha='center', va='bottom')
-        
-    plt.xticks(rotation=45, ha='right')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    
-    plot_path_0 = os.path.join(run_dir, "comparison_accuracy_class0.png")
-    plt.savefig(plot_path_0)
-    plt.close(fig)
-    print(f"Saved comparison plot for Class 0 Accuracy to {plot_path_0}")
+    # 2. Best F1 Score
+    if 'best_f1' in comp_df.columns:
+        plot_bar_metric(
+            model_names, 
+            comp_df['best_f1'].tolist(), 
+            "Best F1 Score", 
+            "teal", 
+            run_dir, 
+            "comparison_best_f1.png"
+        )
 
-    # --- Accuracy Class 1 Comparison (Anomaly Samples) ---
-    acc_class1 = comp_df['accuracy_class1_at_0.5'].tolist()
+    # 3. Overall Accuracy at 0.5
+    if 'accuracy_at_0.5' in comp_df.columns:
+        plot_bar_metric(
+            model_names, 
+            comp_df['accuracy_at_0.5'].tolist(), 
+            "Accuracy (Threshold 0.5)", 
+            "cornflowerblue", 
+            run_dir, 
+            "comparison_accuracy_overall.png"
+        )
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars = ax.bar(model_names, acc_class1, color='lightcoral')
+    # 4. Class 0 Accuracy (Legacy support)
+    if 'accuracy_class0_at_0.5' in comp_df.columns:
+        plot_bar_metric(
+            model_names, 
+            comp_df['accuracy_class0_at_0.5'].tolist(), 
+            "Accuracy Class 0 (Normal)", 
+            "skyblue", 
+            run_dir, 
+            "comparison_accuracy_class0.png"
+        )
 
-    ax.set_ylabel('Accuracy (Class 1: Anomaly)')
-    ax.set_xlabel('Model')
-    ax.set_title('Comparative Accuracy on Anomaly Samples (Class 1) at Threshold 0.5')
-    
-    # Add labels on top of bars
-    for bar in bars:
-        yval = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, yval + 0.005, round(yval, 4), ha='center', va='bottom')
-        
-    plt.xticks(rotation=45, ha='right')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    
-    plot_path_1 = os.path.join(run_dir, "comparison_accuracy_class1.png")
-    plt.savefig(plot_path_1)
-    plt.close(fig)
-    print(f"Saved comparison plot for Class 1 Accuracy to {plot_path_1}")
-
+    # 5. Class 1 Accuracy (Legacy support)
+    if 'accuracy_class1_at_0.5' in comp_df.columns:
+        plot_bar_metric(
+            model_names, 
+            comp_df['accuracy_class1_at_0.5'].tolist(), 
+            "Accuracy Class 1 (Anomaly)", 
+            "lightcoral", 
+            run_dir, 
+            "comparison_accuracy_class1.png"
+        )
 
 def main():
     """
@@ -150,12 +184,13 @@ def main():
     # 2. Plot learning curves for each individual model
     print("\n--- Generating individual model plots (Learning Curves) ---")
     
-    # Find all model directories inside AutogluonModels
-    model_dirs = [d for d in os.listdir(ag_path) if os.path.isdir(os.path.join(ag_path, d))]
-    
-    for model_name in model_dirs:
-        model_dir = os.path.join(ag_path, model_name)
-        plot_learning_curves(ag_path, model_name, model_dir)
+    if os.path.exists(ag_path):
+        model_dirs = [d for d in os.listdir(ag_path) if os.path.isdir(os.path.join(ag_path, d))]
+        for model_name in model_dirs:
+            model_dir = os.path.join(ag_path, model_name)
+            # Only try to plot if the CSV exists, to avoid warnings for non-model folders
+            if os.path.exists(os.path.join(model_dir, LC_CSV_NAME)):
+                plot_learning_curves(model_name, model_dir)
 
     # 3. Load the comparison CSV
     comp_csv_path = os.path.join(run_dir, COMP_CSV_NAME)
@@ -170,7 +205,7 @@ def main():
         return
     
     # 4. Generate comparative plots
-    print("\n--- Generating comparative plots (Class Accuracies) ---")
+    print("\n--- Generating comparative plots ---")
     plot_model_comparison(comp_df, run_dir)
 
     print("\nPlotting script finished successfully.")
