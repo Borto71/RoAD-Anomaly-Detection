@@ -16,26 +16,28 @@ from sklearn.metrics import (
 from autogluon.tabular import TabularPredictor
 
 
-# ===== Copia delle funzioni di normalizzazione dal tuo main.py ===== #
-
-def compute_minmax(train_records, num_features=86):
+def compute_minmax(train_records, num_features = 86):
     arrays = [np.asarray(rec)[:, :num_features] for rec in train_records]
-    big = np.concatenate(arrays, axis=0)
+    big = np.concatenate(arrays, axis = 0) 
 
-    feat_min = big.min(axis=0)
-    feat_max = big.max(axis=0)
+    feat_min = big.min(axis = 0)
+    feat_max = big.max(axis = 0)
 
     return feat_min.astype(np.float32), feat_max.astype(np.float32)
 
 
-def minmax_scale(arr, min_vals, max_vals, eps=1e-8):
+def minmax_scale(arr, min_vals, max_vals, eps = 1e-8):
     arr = arr.astype(np.float32)
     num = arr - min_vals
     den = (max_vals - min_vals) + eps
     return 2.0 * (num / den) - 1.0
 
 
-def normalize_records(records, feat_min, feat_max, num_features=86):
+def normalize_records(records, feat_min, feat_max, num_features = 86):
+    """
+    Normalize only the feature columns (first num_features columns) using
+    min-max scaling to [-1, 1].
+    """
     norm_recs = []
     for rec in records:
         arr = np.asarray(rec)
@@ -51,8 +53,6 @@ def normalize_records(records, feat_min, feat_max, num_features=86):
         norm_recs.append(arr_scaled)
     return norm_recs
 
-
-# ===== Metriche "globali" tipo anomaly detection ===== #
 
 def compute_metrics_from_scores(scores, labels):
     scores = np.asarray(scores)
@@ -74,7 +74,7 @@ def compute_metrics_from_scores(scores, labels):
     for thr in unique_scores:
         y_pred = (scores >= thr).astype(int)
         prec, rec, f1, _ = precision_recall_fscore_support(
-            labels, y_pred, average="binary", zero_division=0
+            labels, y_pred, average = "binary", zero_division = 0
         )
         if f1 > best_f1:
             best_f1 = f1
@@ -99,7 +99,7 @@ def compute_metrics_from_scores(scores, labels):
     else:
         acc_overall = acc_normal = acc_anom = None
 
-    metrics = {
+    metrics = { # dictionary of computed metrics
         "roc_auc": float(roc_auc),
         "pr_auc": float(pr_auc),
         "mean_loss_normal": mean_loss_normal,
@@ -115,36 +115,30 @@ def compute_metrics_from_scores(scores, labels):
     return metrics
 
 
-# ===== Metriche extra per modello/split (loss per classe, ecc.) ===== #
-
 def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
     """
-    Calcola:
-      - AUC-ROC, PR-AUC
-      - F1 e threshold migliore (scan su score unici)
-      - accuracy a soglia 0.5
-      - BCE loss globale, e per classe 0/1
-      - se richiesto: "learning curve" accuracy/loss vs threshold
+    Compute BCE losses and various metrics from true labels and predicted scores.
+    Optionally compute learning curve data for given thresholds.
     """
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
 
-    # clip per stabilità numerica
+    # clip for numerical stability
     eps = 1e-7
     p = np.clip(scores, eps, 1 - eps)
 
-    # BCE per campione
+    # BCE loss
     bce = -(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
 
     loss_overall = float(bce.mean())
     loss_class0 = float(bce[y_true == 0].mean()) if np.any(y_true == 0) else None
     loss_class1 = float(bce[y_true == 1].mean()) if np.any(y_true == 1) else None
 
-    # AUC e PR-AUC
+    # AUC amd PR-AUC
     auc_roc = roc_auc_score(y_true, scores)
     pr_auc = average_precision_score(y_true, scores)
 
-    # F1 e threshold migliore (scan su score unici)
+    # F1 and threshold optimization
     unique_scores = np.unique(scores)
     best_f1 = -1.0
     best_prec = 0.0
@@ -162,30 +156,48 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
             best_rec = rec
             best_thr = thr
 
-    # metriche a soglia 0.5
+    # metrics at threshold 0.5
     y_pred_05 = (scores >= 0.5).astype(int)
     prec_05, rec_05, f1_05, _ = precision_recall_fscore_support(
         y_true, y_pred_05, average="binary", zero_division=0
     )
     acc_05 = float((y_pred_05 == y_true).mean())
 
+    # confusion matrix components at 0.5
+    tp = int(((y_true == 1) & (y_pred_05 == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred_05 == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred_05 == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred_05 == 0)).sum())
+
+    den_class0 = tn + fp
+    den_class1 = tp + fn
+
+    acc_class0_05 = float(tn / den_class0) if den_class0 > 0 else None
+    acc_class1_05 = float(tp / den_class1) if den_class1 > 0 else None
+
     metrics = {
         "auc_roc": float(auc_roc),
         "pr_auc": float(pr_auc),
+
         "bce_loss_overall": loss_overall,
         "bce_loss_class0": loss_class0,
         "bce_loss_class1": loss_class1,
+
         "best_f1": float(best_f1),
         "best_precision": float(best_prec),
         "best_recall": float(best_rec),
         "best_threshold": float(best_thr) if best_thr is not None else None,
+
         "f1_at_0.5": float(f1_05),
         "precision_at_0.5": float(prec_05),
         "recall_at_0.5": float(rec_05),
         "accuracy_at_0.5": acc_05,
+
+        "accuracy_class0_at_0.5": acc_class0_05,
+        "accuracy_class1_at_0.5": acc_class1_05,
     }
 
-    # "learning curve" accuracy / loss vs threshold (sul test)
+    # learning curve data
     learning_curve = None
     if thresholds_for_curve is not None:
         thresholds_for_curve = np.asarray(thresholds_for_curve)
@@ -194,8 +206,7 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
         for thr in thresholds_for_curve:
             y_pred_thr = (scores >= thr).astype(int)
             acc = float((y_pred_thr == y_true).mean())
-            # BCE non dipende da thr, quindi possiamo lasciare quella globale
-            # ma per completezza mettiamo sempre la stessa (se vuoi puoi cambiarla)
+            # BCE loss at this threshold
             acc_list.append(acc)
             loss_list.append(loss_overall)
 
@@ -209,24 +220,19 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
 
     return metrics, learning_curve
 
-
-# ===== Costruzione DataFrame a finestre, con statistiche e subsampling ===== #
-
 def build_window_dataframe_stats(
     records,
-    window_size=256,
-    stride=128,
-    num_features=86,
-    label_col_name="is_anomaly",
-    scenario_name=None,
-    max_windows=None,
-    random_state=42,
+    window_size = 256,
+    stride = 128,
+    num_features = 86,
+    label_col_name = "is_anomaly",
+    scenario_name = None,
+    max_windows = None,
+    random_state = 42,
 ):
     """
-    Ogni finestra -> statistiche per feature:
-        [mean, std, min, max] -> 4 * num_features feature totali.
-    label finestra = 1 se all’interno c’è almeno un timestep con anomaly > 0, altrimenti 0.
-    max_windows: se non None, limitiamo il numero di finestre per scenario (random subsampling).
+    Build a DataFrame of windowed statistics from the given records.
+    Each window is represented by mean, std, min, max of each feature.
     """
     rng = np.random.default_rng(random_state)
 
@@ -246,7 +252,7 @@ def build_window_dataframe_stats(
 
         starts = list(range(0, N - window_size + 1, stride))
         if max_windows is not None and len(starts) > max_windows:
-            starts = list(rng.choice(starts, size=max_windows, replace=False))
+            starts = list(rng.choice(starts, size = max_windows, replace = False))
 
         for start in starts:
             end = start + window_size
@@ -255,12 +261,12 @@ def build_window_dataframe_stats(
 
             window_label = 1 if window_labels.max() > 0 else 0
 
-            mean = window_feats.mean(axis=0)
-            std = window_feats.std(axis=0)
-            wmin = window_feats.min(axis=0)
-            wmax = window_feats.max(axis=0)
+            mean = window_feats.mean(axis = 0)
+            std = window_feats.std(axis = 0)
+            wmin = window_feats.min(axis = 0)
+            wmax = window_feats.max(axis = 0)
 
-            feat_vec = np.concatenate([mean, std, wmin, wmax], axis=0)
+            feat_vec = np.concatenate([mean, std, wmin, wmax], axis = 0)
 
             rows.append(feat_vec)
             labels.append(window_label)
@@ -272,7 +278,7 @@ def build_window_dataframe_stats(
     if not rows:
         return pd.DataFrame()
 
-    X = np.stack(rows, axis=0)
+    X = np.stack(rows, axis = 0)
     feature_names = []
     for stat in ["mean", "std", "min", "max"]:
         feature_names += [f"{stat}_f{i}" for i in range(num_features)]
@@ -283,9 +289,6 @@ def build_window_dataframe_stats(
 
     return df
 
-
-# ===== main AutoGluon ===== #
-
 def main():
     # Run dir
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -293,8 +296,8 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     print(f"\nSaving outputs to: {run_dir}")
 
-    # Carica dataset RoAD
-    ds = RoADDataset(normalize=False)
+    # Load dataset
+    ds = RoADDataset(normalize = False)
     print("Subsets available:", ds.sets.keys())
 
     base_train_records = ds.sets["training"]
@@ -317,76 +320,76 @@ def main():
     num_features = 86
     label_col = "is_anomaly"
 
-    # Puoi modificare in base alla RAM
+    # For subsampling windows per scenario
     max_windows_per_scenario = 5000
 
-    # 1) min/max solo su training
+    # 1) min/max only on train
     print("Computing global min/max over the training set...")
-    feat_min, feat_max = compute_minmax(train_records, num_features=num_features)
+    feat_min, feat_max = compute_minmax(train_records, num_features = num_features)
 
-    # 2) normalizzazione
-    train_norm = normalize_records(train_records, feat_min, feat_max, num_features=num_features)
-    collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features=num_features)
-    weight_norm = normalize_records(weight_records, feat_min, feat_max, num_features=num_features)
-    velocity_norm = normalize_records(velocity_records, feat_min, feat_max, num_features=num_features)
-    control_norm = normalize_records(control_records, feat_min, feat_max, num_features=num_features)
+    # 2) Normalize all records
+    train_norm = normalize_records(train_records, feat_min, feat_max, num_features = num_features)
+    collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features = num_features)
+    weight_norm = normalize_records(weight_records, feat_min, feat_max, num_features = num_features)
+    velocity_norm = normalize_records(velocity_records, feat_min, feat_max, num_features = num_features)
+    control_norm = normalize_records(control_records, feat_min, feat_max, num_features = num_features)
 
-    # 3) DataFrame a finestre (con statistiche + subsampling)
+    # 3) DataFrame with windowed stats + subsampling
     print("Building windowed DataFrames with stats and subsampling...")
 
     df_train = build_window_dataframe_stats(
         train_norm,
-        window_size=window_size,
-        stride=stride,
-        num_features=num_features,
-        label_col_name=label_col,
-        scenario_name="train",
-        max_windows=max_windows_per_scenario,
-        random_state=0,
+        window_size = window_size,
+        stride = stride,
+        num_features = num_features,
+        label_col_name = label_col,
+        scenario_name = "train",
+        max_windows = max_windows_per_scenario,
+        random_state = 0,
     )
 
     df_collision = build_window_dataframe_stats(
         collision_norm,
-        window_size=window_size,
-        stride=stride,
-        num_features=num_features,
-        label_col_name=label_col,
-        scenario_name="collision",
-        max_windows=max_windows_per_scenario,
-        random_state=1,
+        window_size = window_size,
+        stride = stride,
+        num_features = num_features,
+        label_col_name = label_col,
+        scenario_name = "collision",
+        max_windows = max_windows_per_scenario,
+        random_state = 1,
     )
 
     df_weight = build_window_dataframe_stats(
         weight_norm,
-        window_size=window_size,
-        stride=stride,
-        num_features=num_features,
-        label_col_name=label_col,
-        scenario_name="weight",
-        max_windows=max_windows_per_scenario,
-        random_state=2,
+        window_size = window_size,
+        stride = stride,
+        num_features = num_features,
+        label_col_name = label_col,
+        scenario_name = "weight",
+        max_windows = max_windows_per_scenario,
+        random_state = 2,
     )
 
     df_velocity = build_window_dataframe_stats(
         velocity_norm,
-        window_size=window_size,
-        stride=stride,
-        num_features=num_features,
-        label_col_name=label_col,
-        scenario_name="velocity",
-        max_windows=max_windows_per_scenario,
-        random_state=3,
+        window_size = window_size,
+        stride = stride,
+        num_features = num_features,
+        label_col_name = label_col,
+        scenario_name = "velocity",
+        max_windows = max_windows_per_scenario,
+        random_state = 3,
     )
 
     df_control = build_window_dataframe_stats(
         control_norm,
-        window_size=window_size,
-        stride=stride,
-        num_features=num_features,
-        label_col_name=label_col,
-        scenario_name="control",
-        max_windows=max_windows_per_scenario,
-        random_state=4,
+        window_size = window_size,
+        stride = stride,
+        num_features = num_features,
+        label_col_name = label_col,
+        scenario_name = "control",
+        max_windows = max_windows_per_scenario,
+        random_state = 4,
     )
 
     print("Windows per subset (dopo subsampling):")
@@ -396,11 +399,11 @@ def main():
     print("  velocity  :", len(df_velocity))
     print("  control   :", len(df_control))
 
-    # 4) concat di tutti gli scenari
+    # 4) Concatenation for all data
     df_all = pd.concat(
         [df_train, df_collision, df_weight, df_velocity, df_control],
-        axis=0,
-        ignore_index=True,
+        axis = 0,
+        ignore_index = True,
     )
 
     print("Total windows:", len(df_all))
@@ -410,9 +413,9 @@ def main():
     # 5) train/test split stratificato
     train_df, test_df = train_test_split(
         df_all,
-        test_size=0.3,
-        random_state=42,
-        stratify=df_all[label_col],
+        test_size = 0.3,
+        random_state = 42,
+        stratify = df_all[label_col],
     )
 
     print("Train windows:", len(train_df))
@@ -422,23 +425,23 @@ def main():
     ag_path = os.path.join(run_dir, "AutogluonModels")
 
     predictor = TabularPredictor(
-        label=label_col,
-        problem_type="binary",
-        eval_metric="roc_auc",
-        path=ag_path,
+        label = label_col,
+        problem_type = "binary",
+        eval_metric = "roc_auc",
+        path = ag_path,
     ).fit(
-        train_data=train_df,
-        presets="medium_quality_faster_train",
-        time_limit=None,
+        train_data = train_df,
+        presets = "medium_quality_faster_train",
+        time_limit = None,
     )
 
-    # 7) leaderboard (su test per vedere performance)
-    leaderboard = predictor.leaderboard(test_df, silent=True)
+    # 7) leaderboard 
+    leaderboard = predictor.leaderboard(test_df, silent = True)
     leaderboard_csv_path = os.path.join(run_dir, "leaderboard.csv")
-    leaderboard.to_csv(leaderboard_csv_path, index=False)
+    leaderboard.to_csv(leaderboard_csv_path, index = False)
     print(f"Saved AutoGluon leaderboard to {leaderboard_csv_path}")
 
-    # 8) metriche complessive sul best model (come prima, per avere un riassunto)
+    # 8) metrics on test (best model)
     y_true_test = test_df[label_col].values
     proba_best = predictor.predict_proba(test_df)  # best model
     if isinstance(proba_best, pd.DataFrame):
@@ -454,7 +457,7 @@ def main():
     for k, v in metrics_global.items():
         print(f"  {k}: {v}")
 
-    # 9) salvataggio config + metriche globali
+    # 9) Saving the overall metrics
     results = {
         "config": {
             "window_size": window_size,
@@ -478,20 +481,24 @@ def main():
         json.dump(results, f, indent=2)
     print(f"Saved overall metrics to {metrics_path}")
 
-    # 10) METRICHE PER OGNI MODELLO + LEARNING CURVE (accuracy/loss vs soglia)
+    # 10) Metrics for each model + learning curves
     print("\nComputing per-model metrics and learning curves...")
 
-    # thresholds per la learning curve (test)
+    # thresholds for learning curve
     thresholds = np.linspace(0.01, 0.99, 99)
 
     model_names = leaderboard["model"].tolist()
+
+    # lists to build comparison CSV
+    comparison_rows = []
+
     for model_name in model_names:
         print(f"  -> Model: {model_name}")
 
         model_dir = os.path.join(ag_path, model_name)
         os.makedirs(model_dir, exist_ok=True)
 
-        # --- Train split ---
+        # Train split
         y_train = train_df[label_col].values
         proba_train = predictor.predict_proba(train_df, model=model_name)
 
@@ -506,10 +513,10 @@ def main():
         metrics_train, _ = compute_bce_losses_and_metrics(
             y_true=y_train,
             scores=scores_train,
-            thresholds_for_curve=None,  # learning curve la facciamo solo su test
+            thresholds_for_curve=None,  # learning curve only on test
         )
 
-        # --- Test split ---
+        # Test split
         y_test = test_df[label_col].values
         proba_test = predictor.predict_proba(test_df, model=model_name)
 
@@ -527,7 +534,7 @@ def main():
             thresholds_for_curve=thresholds,
         )
 
-        # --- salva metrics train/test in JSON nella cartella del modello ---
+        # save metrics JSON
         per_model_metrics = {
             "train": metrics_train,
             "test": metrics_test,
@@ -537,10 +544,46 @@ def main():
         with open(metrics_model_path, "w") as f:
             json.dump(per_model_metrics, f, indent=2)
 
-        # --- salva learning curve (accuracy e loss vs threshold) su test ---
+        # save learning curve CSV (test)
         if lc_test is not None:
             lc_path = os.path.join(model_dir, "learning_curve_test.csv")
             lc_test.to_csv(lc_path, index=False)
+
+        # row for comparison CSV 
+        comparison_rows.append(
+            {
+                "model": model_name,
+
+                # Loss
+                "bce_loss_overall": metrics_test["bce_loss_overall"],
+                "bce_loss_class0": metrics_test["bce_loss_class0"],
+                "bce_loss_class1": metrics_test["bce_loss_class1"],
+
+                # Accuracy 
+                "accuracy_class0_at_0.5": metrics_test["accuracy_class0_at_0.5"],
+                "accuracy_class1_at_0.5": metrics_test["accuracy_class1_at_0.5"],
+
+                # Accuracy 
+                "accuracy_at_0.5": metrics_test["accuracy_at_0.5"],
+
+                # Precision
+                "precision_at_0.5": metrics_test["precision_at_0.5"],
+                "recall_at_0.5": metrics_test["recall_at_0.5"],
+                "f1_at_0.5": metrics_test["f1_at_0.5"],
+
+                # best threshold metrics
+                "best_threshold": metrics_test["best_threshold"],
+                "best_f1": metrics_test["best_f1"],
+                "best_precision": metrics_test["best_precision"],
+                "best_recall": metrics_test["best_recall"],
+            }
+        )
+
+    # Save comparison CSV
+    comparison_df = pd.DataFrame(comparison_rows)
+    comparison_csv_path = os.path.join(run_dir, "models_comparison_test.csv")
+    comparison_df.to_csv(comparison_csv_path, index=False)
+    print(f"Saved per-model comparison metrics to {comparison_csv_path}")
 
     print("Done computing per-model metrics and learning curves.")
 
