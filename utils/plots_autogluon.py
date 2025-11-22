@@ -28,13 +28,13 @@ def find_latest_run_dir(base_dir):
 
 def plot_learning_curves(model_name, model_dir):
     """
-    Generates and saves the Learning Curve plot (Accuracy and Loss vs. Threshold) 
-    for a specific model from its CSV file.
+    Generates and saves the Learning Curve plot.
+    If extended metrics (F1, Acc Class 0, Acc Class 1) are present, plots a 2x2 grid.
+    Otherwise, falls back to the standard Accuracy/Loss plot.
     """
     lc_path = os.path.join(model_dir, LC_CSV_NAME)
     
     if not os.path.exists(lc_path):
-        # Quietly return if file doesn't exist (avoids spam for non-model folders)
         return
 
     try:
@@ -43,35 +43,78 @@ def plot_learning_curves(model_name, model_dir):
         print(f"Error reading learning curve CSV for {model_name}: {e}")
         return
 
-    print(f"  -> Plotting learning curve for {model_name}")
+    print(f"  -> Plotting metrics for {model_name}")
 
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    
-    # Plot Accuracy on the primary y-axis (left)
-    color_acc = 'tab:blue'
-    ax1.set_xlabel('Threshold')
-    ax1.set_ylabel('Accuracy', color=color_acc)
-    ax1.plot(lc_df['threshold'], lc_df['accuracy'], color=color_acc, label='Accuracy')
-    ax1.tick_params(axis='y', labelcolor=color_acc)
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    # Colonne necessarie per i grafici estesi
+    required_cols = ['f1_score', 'accuracy_class0', 'accuracy_class1']
+    has_extended_metrics = all(col in lc_df.columns for col in required_cols)
 
-    # Create a secondary y-axis for Loss (right)
-    ax2 = ax1.twinx()  
-    color_loss = 'tab:red'
-    ax2.set_ylabel('BCE Loss', color=color_loss)  
-    
-    # Plot Loss
-    ax2.plot(lc_df['threshold'], lc_df['loss'], color=color_loss, linestyle='--', label='BCE Loss')
-    ax2.tick_params(axis='y', labelcolor=color_loss)
-    
-    fig.suptitle(f'Test Set: Accuracy and Loss vs. Threshold for {model_name}')
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95]) 
+    if has_extended_metrics:
+        # --- MODALITÀ ESTESA (4 Grafici) ---
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle(f'Metrics vs Threshold - {model_name}', fontsize=16)
+        
+        # Definizione dei 4 subplot
+        metrics_config = [
+            (0, 0, 'f1_score', 'F1 Score', 'tab:green'),
+            (0, 1, 'loss', 'BCE Loss', 'tab:red'),
+            (1, 0, 'accuracy_class0', 'Accuracy Class 0 (Normal)', 'tab:blue'),
+            (1, 1, 'accuracy_class1', 'Accuracy Class 1 (Anomaly)', 'tab:orange')
+        ]
+        
+        for r, c, col, title, color in metrics_config:
+            ax = axs[r, c]
+            if col in lc_df.columns:
+                ax.plot(lc_df['threshold'], lc_df[col], color=color, linewidth=2)
+                ax.set_title(title)
+                ax.set_xlabel('Threshold')
+                ax.set_ylabel('Score')
+                ax.grid(True, linestyle='--', alpha=0.5)
+                
+                # Se non è la Loss, fissa asse Y tra 0 e 1 per leggibilità
+                if col != 'loss':
+                    ax.set_ylim(-0.05, 1.05)
+                    # Segna il punto massimo
+                    max_idx = lc_df[col].idxmax()
+                    max_val = lc_df[col].max()
+                    max_thr = lc_df['threshold'].iloc[max_idx]
+                    ax.scatter(max_thr, max_val, color='black', zorder=5, s=30)
+                    ax.text(max_thr, max_val, f' Max: {max_val:.3f}', fontsize=9, verticalalignment='bottom')
 
-    # Save plot
-    plot_path = os.path.join(model_dir, "learning_curve_test.png")
-    plt.savefig(plot_path)
-    plt.close(fig)
-    # print(f"     Saved to {plot_path}")
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Salva come file distinto per metriche dettagliate
+        plot_path = os.path.join(model_dir, "detailed_metrics_vs_threshold.png")
+        plt.savefig(plot_path)
+        plt.close(fig)
+        
+    else:
+        # --- MODALITÀ STANDARD (Solo Accuracy e Loss) ---
+        # (Questo è il tuo codice originale mantenuto per retro-compatibilità)
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        
+        color_acc = 'tab:blue'
+        ax1.set_xlabel('Threshold')
+        ax1.set_ylabel('Accuracy', color=color_acc)
+        ax1.plot(lc_df['threshold'], lc_df['accuracy'], color=color_acc, label='Accuracy')
+        ax1.tick_params(axis='y', labelcolor=color_acc)
+        ax1.grid(True, linestyle='--', alpha=0.6)
+
+        ax2 = ax1.twinx()  
+        color_loss = 'tab:red'
+        ax2.set_ylabel('BCE Loss', color=color_loss)  
+        
+        if 'loss' in lc_df.columns:
+            ax2.plot(lc_df['threshold'], lc_df['loss'], color=color_loss, linestyle='--', label='BCE Loss')
+        ax2.tick_params(axis='y', labelcolor=color_loss)
+        
+        fig.suptitle(f'Test Set: Accuracy and Loss vs. Threshold for {model_name}')
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95]) 
+
+        plot_path = os.path.join(model_dir, "learning_curve_test.png")
+        plt.savefig(plot_path)
+        plt.close(fig)
+
 
 def plot_bar_metric(model_names, values, metric_name, color, run_dir, filename):
     """

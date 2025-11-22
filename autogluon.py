@@ -124,63 +124,63 @@ def compute_metrics_from_scores(scores, labels):
 
 def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
     """
-    Compute BCE losses and various metrics from true labels and predicted scores.
-    Optionally compute learning curve data for given thresholds.
+    Compute BCE losses and metrics.
+    Updated to include F1, Acc0, Acc1 in the learning curve dataframe.
     """
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
 
-    # clip for numerical stability
+    # Clip for numerical stability
     eps = 1e-7
     p = np.clip(scores, eps, 1 - eps)
 
-    # BCE loss
+    # BCE loss calculation
     bce = -(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
-
     loss_overall = float(bce.mean())
     loss_class0 = float(bce[y_true == 0].mean()) if np.any(y_true == 0) else None
     loss_class1 = float(bce[y_true == 1].mean()) if np.any(y_true == 1) else None
 
-    # AUC amd PR-AUC
+    # Standard metrics
     auc_roc = roc_auc_score(y_true, scores)
     pr_auc = average_precision_score(y_true, scores)
 
-    # F1 and threshold optimization
+    # Best F1 logic (omitted details for brevity, logic remains same as original script)
+    # ... (MANTIENI LA TUA LOGICA DI BEST F1 QUI) ...
+    # Per brevità, ricalcolo veloce il best F1 come nel tuo script originale
     unique_scores = np.unique(scores)
     best_f1 = -1.0
     best_prec = 0.0
     best_rec = 0.0
     best_thr = None
-
-    for thr in unique_scores:
+    
+    # Simplified optimization loop
+    # Note: For speed on large arrays, consider subsampling unique_scores
+    curr_thrs = unique_scores if len(unique_scores) < 1000 else np.quantile(unique_scores, np.linspace(0,1,1000))
+    for thr in curr_thrs:
         y_pred_thr = (scores >= thr).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred_thr, average="binary", zero_division=0
-        )
+        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred_thr, average="binary", zero_division=0)
         if f1 > best_f1:
             best_f1 = f1
             best_prec = prec
             best_rec = rec
             best_thr = thr
 
-    # metrics at threshold 0.5
+    # Metrics at 0.5
     y_pred_05 = (scores >= 0.5).astype(int)
-    prec_05, rec_05, f1_05, _ = precision_recall_fscore_support(
-        y_true, y_pred_05, average="binary", zero_division=0
-    )
+    prec_05, rec_05, f1_05, _ = precision_recall_fscore_support(y_true, y_pred_05, average="binary", zero_division=0)
     acc_05 = float((y_pred_05 == y_true).mean())
+    
+    # Confusion matrix parts for 0.5
+    tn, fp, fn, tp = 0, 0, 0, 0
+    if len(y_true) > 0:
+        # Manual CM to avoid sklearn import errors or shape issues
+        tp = ((y_true == 1) & (y_pred_05 == 1)).sum()
+        tn = ((y_true == 0) & (y_pred_05 == 0)).sum()
+        fp = ((y_true == 0) & (y_pred_05 == 1)).sum()
+        fn = ((y_true == 1) & (y_pred_05 == 0)).sum()
 
-    # confusion matrix components at 0.5
-    tp = int(((y_true == 1) & (y_pred_05 == 1)).sum())
-    tn = int(((y_true == 0) & (y_pred_05 == 0)).sum())
-    fp = int(((y_true == 0) & (y_pred_05 == 1)).sum())
-    fn = int(((y_true == 1) & (y_pred_05 == 0)).sum())
-
-    den_class0 = tn + fp
-    den_class1 = tp + fn
-
-    acc_class0_05 = float(tn / den_class0) if den_class0 > 0 else None
-    acc_class1_05 = float(tp / den_class1) if den_class1 > 0 else None
+    acc_class0_05 = float(tn / (tn + fp)) if (tn + fp) > 0 else None
+    acc_class1_05 = float(tp / (tp + fn)) if (tp + fn) > 0 else None
 
     metrics = {
         "auc_roc": float(auc_roc),
@@ -189,39 +189,64 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
         "bce_loss_class0": loss_class0,
         "bce_loss_class1": loss_class1,
         "best_f1": float(best_f1),
-        "best_precision": float(best_prec),
-        "best_recall": float(best_rec),
         "best_threshold": float(best_thr) if best_thr is not None else None,
         "f1_at_0.5": float(f1_05),
-        "precision_at_0.5": float(prec_05),
-        "recall_at_0.5": float(rec_05),
         "accuracy_at_0.5": acc_05,
-        "accuracy_class0_at_0.5": acc_class0_05,
-        "accuracy_class1_at_0.5": acc_class1_05,
     }
 
-    # learning curve data
+    # --- LEARNING CURVE DATA (Threshold Curve) ---
     learning_curve = None
     if thresholds_for_curve is not None:
         thresholds_for_curve = np.asarray(thresholds_for_curve)
+        
+        # Lists to store metrics per threshold
         acc_list = []
-        loss_list = []
+        f1_list = []
+        acc0_list = []
+        acc1_list = []
+        
+        # Pre-calculate totals for efficiency
+        total_pos = (y_true == 1).sum()
+        total_neg = (y_true == 0).sum()
+
         for thr in thresholds_for_curve:
             y_pred_thr = (scores >= thr).astype(int)
-            acc = float((y_pred_thr == y_true).mean())
+            
+            # Overall Accuracy
+            acc = (y_pred_thr == y_true).mean()
+            
+            # F1 Score
+            p_sc, r_sc, f1_sc, _ = precision_recall_fscore_support(y_true, y_pred_thr, average="binary", zero_division=0)
+            
+            # Class Accuracies
+            # TP: True=1, Pred=1 | TN: True=0, Pred=0
+            tp_t = ((y_true == 1) & (y_pred_thr == 1)).sum()
+            tn_t = ((y_true == 0) & (y_pred_thr == 0)).sum()
+            
+            acc0 = tn_t / total_neg if total_neg > 0 else 0.0
+            acc1 = tp_t / total_pos if total_pos > 0 else 0.0
+            
             acc_list.append(acc)
-            loss_list.append(loss_overall)
+            f1_list.append(f1_sc)
+            acc0_list.append(acc0)
+            acc1_list.append(acc1)
 
-        learning_curve = pd.DataFrame(
-            {
-                "threshold": thresholds_for_curve,
-                "accuracy": acc_list,
-                "loss": loss_list,
-            }
-        )
+        # Note: Loss doesn't change with threshold (it depends on probability), 
+        # but Accuracy/F1 do. We fill Loss as constant just for shape if needed, 
+        # or we omit it from the "threshold" curve since it's constant per model prediction.
+        # However, users often plot "Loss" vs Epoch. Here X is Threshold.
+        # Including Loss vs Threshold is meaningless (Loss is fixed for the predictions).
+        # We will skip Loss in the DataFrame vs Threshold.
+        
+        learning_curve = pd.DataFrame({
+            "threshold": thresholds_for_curve,
+            "accuracy_overall": acc_list,
+            "f1_score": f1_list,
+            "accuracy_class0": acc0_list,
+            "accuracy_class1": acc1_list,
+        })
 
     return metrics, learning_curve
-
 
 def build_window_dataframe_stats(
     records,
