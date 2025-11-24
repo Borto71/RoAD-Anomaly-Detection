@@ -5,7 +5,6 @@ import json
 import numpy as np
 import pandas as pd
 
-# Assuming RoADDataset is in the same directory or python path
 from RoADDataset import Dataset as RoADDataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -16,7 +15,7 @@ from sklearn.metrics import (
 
 from autogluon.tabular import TabularPredictor
 
-
+# Compute global min/max for feature scaling
 def compute_minmax(train_records, num_features=86):
     arrays = [np.asarray(rec)[:, :num_features] for rec in train_records]
     big = np.concatenate(arrays, axis=0)
@@ -26,19 +25,15 @@ def compute_minmax(train_records, num_features=86):
 
     return feat_min.astype(np.float32), feat_max.astype(np.float32)
 
-
+# Min-Max scaling to [-1, 1]
 def minmax_scale(arr, min_vals, max_vals, eps=1e-8):
     arr = arr.astype(np.float32)
     num = arr - min_vals
     den = (max_vals - min_vals) + eps
     return 2.0 * (num / den) - 1.0
 
-
+# Normalize records
 def normalize_records(records, feat_min, feat_max, num_features=86):
-    """
-    Normalize only the feature columns (first num_features columns) using
-    min-max scaling to [-1, 1].
-    """
     norm_recs = []
     for rec in records:
         arr = np.asarray(rec)
@@ -54,7 +49,7 @@ def normalize_records(records, feat_min, feat_max, num_features=86):
         norm_recs.append(arr_scaled)
     return norm_recs
 
-
+# Compute metrics from scores and true labels
 def compute_metrics_from_scores(scores, labels):
     scores = np.asarray(scores)
     labels = np.asarray(labels)
@@ -76,8 +71,6 @@ def compute_metrics_from_scores(scores, labels):
     best_thr = None
     best_conf = None
 
-    # Basic optimization loop for threshold
-    # (For large datasets, consider subsampling unique_scores for speed)
     for thr in unique_scores:
         y_pred = (scores >= thr).astype(int)
         prec, rec, f1, _ = precision_recall_fscore_support(
@@ -121,67 +114,38 @@ def compute_metrics_from_scores(scores, labels):
     }
     return metrics
 
-
+# Compute BCE losses and metrics, with optional learning curve
 def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
-    """
-    Compute BCE losses and metrics.
-    Updated to include F1, Acc0, Acc1 in the learning curve dataframe.
-    """
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
 
-    # Clip for numerical stability
     eps = 1e-7
     p = np.clip(scores, eps, 1 - eps)
 
-    # BCE loss calculation
     bce = -(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
     loss_overall = float(bce.mean())
     loss_class0 = float(bce[y_true == 0].mean()) if np.any(y_true == 0) else None
     loss_class1 = float(bce[y_true == 1].mean()) if np.any(y_true == 1) else None
 
-    # Standard metrics
     auc_roc = roc_auc_score(y_true, scores)
     pr_auc = average_precision_score(y_true, scores)
 
-    # Best F1 logic (omitted details for brevity, logic remains same as original script)
-    # ... (MANTIENI LA TUA LOGICA DI BEST F1 QUI) ...
-    # Per brevità, ricalcolo veloce il best F1 come nel tuo script originale
     unique_scores = np.unique(scores)
     best_f1 = -1.0
-    best_prec = 0.0
-    best_rec = 0.0
     best_thr = None
     
-    # Simplified optimization loop
-    # Note: For speed on large arrays, consider subsampling unique_scores
     curr_thrs = unique_scores if len(unique_scores) < 1000 else np.quantile(unique_scores, np.linspace(0,1,1000))
     for thr in curr_thrs:
         y_pred_thr = (scores >= thr).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred_thr, average="binary", zero_division=0)
+        _, _, f1, _ = precision_recall_fscore_support(y_true, y_pred_thr, average="binary", zero_division=0)
         if f1 > best_f1:
             best_f1 = f1
-            best_prec = prec
-            best_rec = rec
             best_thr = thr
 
-    # Metrics at 0.5
     y_pred_05 = (scores >= 0.5).astype(int)
-    prec_05, rec_05, f1_05, _ = precision_recall_fscore_support(y_true, y_pred_05, average="binary", zero_division=0)
+    _, _, f1_05, _ = precision_recall_fscore_support(y_true, y_pred_05, average="binary", zero_division=0)
     acc_05 = float((y_pred_05 == y_true).mean())
     
-    # Confusion matrix parts for 0.5
-    tn, fp, fn, tp = 0, 0, 0, 0
-    if len(y_true) > 0:
-        # Manual CM to avoid sklearn import errors or shape issues
-        tp = ((y_true == 1) & (y_pred_05 == 1)).sum()
-        tn = ((y_true == 0) & (y_pred_05 == 0)).sum()
-        fp = ((y_true == 0) & (y_pred_05 == 1)).sum()
-        fn = ((y_true == 1) & (y_pred_05 == 0)).sum()
-
-    acc_class0_05 = float(tn / (tn + fp)) if (tn + fp) > 0 else None
-    acc_class1_05 = float(tp / (tp + fn)) if (tp + fn) > 0 else None
-
     metrics = {
         "auc_roc": float(auc_roc),
         "pr_auc": float(pr_auc),
@@ -194,32 +158,22 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
         "accuracy_at_0.5": acc_05,
     }
 
-    # Learining curve data
     learning_curve = None
     if thresholds_for_curve is not None:
         thresholds_for_curve = np.asarray(thresholds_for_curve)
-        
-        # Lists to store metrics per threshold
         acc_list = []
         f1_list = []
         acc0_list = []
         acc1_list = []
         
-        # Pre-calculate totals for efficiency
         total_pos = (y_true == 1).sum()
         total_neg = (y_true == 0).sum()
 
         for thr in thresholds_for_curve:
             y_pred_thr = (scores >= thr).astype(int)
-            
-            # Overall Accuracy
             acc = (y_pred_thr == y_true).mean()
+            _, _, f1_sc, _ = precision_recall_fscore_support(y_true, y_pred_thr, average="binary", zero_division=0)
             
-            # F1 Score
-            p_sc, r_sc, f1_sc, _ = precision_recall_fscore_support(y_true, y_pred_thr, average="binary", zero_division=0)
-            
-            # Class Accuracies
-            # TP: True=1, Pred=1 | TN: True=0, Pred=0
             tp_t = ((y_true == 1) & (y_pred_thr == 1)).sum()
             tn_t = ((y_true == 0) & (y_pred_thr == 0)).sum()
             
@@ -231,13 +185,6 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
             acc0_list.append(acc0)
             acc1_list.append(acc1)
 
-        # Note: Loss doesn't change with threshold (it depends on probability), 
-        # but Accuracy/F1 do. We fill Loss as constant just for shape if needed, 
-        # or we omit it from the "threshold" curve since it's constant per model prediction.
-        # However, users often plot "Loss" vs Epoch. Here X is Threshold.
-        # Including Loss vs Threshold is meaningless (Loss is fixed for the predictions).
-        # We will skip Loss in the DataFrame vs Threshold.
-        
         learning_curve = pd.DataFrame({
             "threshold": thresholds_for_curve,
             "accuracy_overall": acc_list,
@@ -248,6 +195,7 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
 
     return metrics, learning_curve
 
+# Build windowed DataFrame with statistics
 def build_window_dataframe_stats(
     records,
     window_size=256,
@@ -257,9 +205,11 @@ def build_window_dataframe_stats(
     scenario_name=None,
     max_windows=None,
     random_state=42,
+    feature_names_list=None  
 ):
     """
     Build a DataFrame of windowed statistics from the given records.
+    Uses feature_names_list to create meaningful column names.
     """
     rng = np.random.default_rng(random_state)
 
@@ -267,12 +217,10 @@ def build_window_dataframe_stats(
     labels = []
     scenarios = []
     
-    # We iterate over the records (which are now already split into train/test)
     for rec_idx, arr in enumerate(records):
         arr = np.asarray(arr)
         N = arr.shape[0]
         
-        # Safety check for short records
         if N < window_size:
             continue
 
@@ -284,24 +232,7 @@ def build_window_dataframe_stats(
 
         starts = list(range(0, N - window_size + 1, stride))
         
-        # Subsampling happens per-record or globally. 
-        # Here it's implemented per-record loop, but logically applied per call.
-        # To strictly respect max_windows for the WHOLE set passed to this function,
-        # we should collect all windows first or sample carefully.
-        # However, the original logic sampled per record call? 
-        # Actually, original logic had "if len(rows) >= max_windows: break".
-        # That means it filled up from the first records and ignored the last ones.
-        # Improved logic: Collect all possible starts, then sample.
-        
-        
         if max_windows is not None and len(starts) > max_windows:
-            # Note: This sampling is per-record in the loop? 
-            # The original code passed `max_windows` to this function, 
-            # but the check `if len(rows) >= max_windows` breaks the outer loop.
-            # Let's trust the shuffle happens before or we accept bias towards first records.
-            # For safety in this fixed version, let's just take all windows here
-            # and shuffle/sample the resulting DataFrame if needed, 
-            # OR rely on the user passing a reasonable subset of records.
             pass 
             
         for start in starts:
@@ -316,6 +247,7 @@ def build_window_dataframe_stats(
             wmin = window_feats.min(axis=0)
             wmax = window_feats.max(axis=0)
 
+            # Concatenate all statistics into a single feature vector
             feat_vec = np.concatenate([mean, std, wmin, wmax], axis=0)
 
             rows.append(feat_vec)
@@ -332,15 +264,19 @@ def build_window_dataframe_stats(
         return pd.DataFrame()
 
     X = np.stack(rows, axis=0)
-    feature_names = []
-    for stat in ["mean", "std", "min", "max"]:
-        feature_names += [f"{stat}_f{i}" for i in range(num_features)]
+    
+    if feature_names_list is None or len(feature_names_list) != num_features:
+        feature_names_list = [f"f{i}" for i in range(num_features)]
+        
+    final_col_names = []
 
-    df = pd.DataFrame(X, columns=feature_names)
+    for stat in ["mean", "std", "min", "max"]:
+        final_col_names += [f"{stat}_{fname}" for fname in feature_names_list]
+
+    df = pd.DataFrame(X, columns=final_col_names)
     df[label_col_name] = labels
     df["scenario"] = scenarios
 
-    # Optional: Shuffle the resulting windows so they aren't ordered by record ID
     df = df.sample(frac=1, random_state=random_state).reset_index(drop=True)
     
     return df
@@ -356,6 +292,37 @@ def main():
     # Load dataset
     ds = RoADDataset(normalize=False)
     print("Subsets available:", ds.sets.keys())
+    
+    # Feature names
+    if hasattr(ds, 'feature_names') and len(ds.feature_names) == 86:
+        original_features = ds.feature_names
+        print("Using feature names provided by Dataset.")
+    else:
+        print("Dataset feature names not found. Using manual list.")
+
+        # original feature names list, taken from dataset documentation
+        original_features = [
+            "robot_action_id", "apparent_power", "current", "frequency", "phase_angle",
+            "power", "power_factor", "reactive_power", "voltage", 
+            "j1_acc_x", "j1_acc_y", "j1_acc_z", "j1_gyro_x", "j1_gyro_y", "j1_gyro_z",
+            "j1_qw", "j1_qx", "j1_qy", "j1_qz", "j1_temp",
+            "j2_acc_x", "j2_acc_y", "j2_acc_z", "j2_gyro_x", "j2_gyro_y", "j2_gyro_z",
+            "j2_qw", "j2_qx", "j2_qy", "j2_qz", "j2_temp",
+            "j3_acc_x", "j3_acc_y", "j3_acc_z", "j3_gyro_x", "j3_gyro_y", "j3_gyro_z",
+            "j3_qw", "j3_qx", "j3_qy", "j3_qz", "j3_temp",
+            "j4_acc_x", "j4_acc_y", "j4_acc_z", "j4_gyro_x", "j4_gyro_y", "j4_gyro_z",
+            "j4_qw", "j4_qx", "j4_qy", "j4_qz", "j4_temp",
+            "j5_acc_x", "j5_acc_y", "j5_acc_z", "j5_gyro_x", "j5_gyro_y", "j5_gyro_z",
+            "j5_qw", "j5_qx", "j5_qy", "j5_qz", "j5_temp",
+            "j6_acc_x", "j6_acc_y", "j6_acc_z", "j6_gyro_x", "j6_gyro_y", "j6_gyro_z",
+            "j6_qw", "j6_qx", "j6_qy", "j6_qz", "j6_temp",
+            "j7_acc_x", "j7_acc_y", "j7_acc_z", "j7_gyro_x", "j7_gyro_y", "j7_gyro_z",
+            "j7_qw", "j7_qx", "j7_qy", "j7_qz", "j7_temp"
+        ]
+        
+        # Immediate check, for safety
+        if len(original_features) != 86:
+            raise ValueError(f"ERRORE: La lista contiene {len(original_features)} nomi, ma ne servono 86!")
 
     # Organize raw records by scenario
     base_train_records = list(ds.sets["training"])
@@ -364,28 +331,24 @@ def main():
     weight_records = list(ds.sets.get("weight", []))
     velocity_records = list(ds.sets.get("velocity", []))
 
-    # Combine base train and control for the "normal" class
     train_group_records = base_train_records + control_records
 
     print(f"Number of training/normal records: {len(train_group_records)}")
     print(f"Number of collision records:       {len(collision_records)}")
-    print(f"Number of weight records:          {len(weight_records)}")
-    print(f"Number of velocity records:        {len(velocity_records)}")
 
     window_size = 256
     stride = 128
     num_features = 86
     label_col = "is_anomaly"
     
-    # Configuration for subsampling windows
     max_windows_train_per_scenario = 4000
     max_windows_test_per_scenario = None
 
-    # 1) Compute min/max ONLY on the training records
+    # 1) Compute min/max
     print("Computing global min/max over the training set...")
     feat_min, feat_max = compute_minmax(train_group_records, num_features=num_features)
 
-    # 2) Normalize ALL records
+    # 2) Normalize
     train_norm = normalize_records(train_group_records, feat_min, feat_max, num_features=num_features)
     collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features=num_features)
     weight_norm = normalize_records(weight_records, feat_min, feat_max, num_features=num_features)
@@ -411,12 +374,10 @@ def main():
         if len(records) > 1:
             recs_train, recs_test = train_test_split(records, test_size=0.3, random_state=42)
         else:
-            print(f"Warning: Scenario '{name}' has only 1 record. Putting it in Train.")
             recs_train = records
             recs_test = []
 
-        print(f"Scenario '{name}': {len(recs_train)} recs for Train, {len(recs_test)} recs for Test.")
-
+        
         df_tr = build_window_dataframe_stats(
             recs_train,
             window_size=window_size,
@@ -426,6 +387,7 @@ def main():
             scenario_name=name,
             max_windows=max_windows_train_per_scenario,
             random_state=10 + len(train_dfs),
+            feature_names_list=original_features, 
         )
         train_dfs.append(df_tr)
 
@@ -438,10 +400,10 @@ def main():
             scenario_name=name,
             max_windows=max_windows_test_per_scenario, 
             random_state=20 + len(test_dfs),
+            feature_names_list=original_features, 
         )
         test_dfs.append(df_te)
 
-    # 4) Concatenate
     train_df = pd.concat(train_dfs, axis=0, ignore_index=True)
     test_df = pd.concat(test_dfs, axis=0, ignore_index=True)
 
@@ -449,8 +411,8 @@ def main():
     test_df = test_df.sample(frac=1, random_state=42).reset_index(drop=True)
 
     print(f"\nFinal Dataset Sizes (Window Level):")
-    print(f"  Train Windows: {len(train_df)} | Anomaly Rate: {train_df[label_col].mean():.2f}")
-    print(f"  Test Windows : {len(test_df)}  | Anomaly Rate: {test_df[label_col].mean():.2f}")
+    print(f"  Train Windows: {len(train_df)}")
+    print(f"  Test Windows : {len(test_df)}")
 
     print("\n[SECURITY] Dropping 'scenario' column to prevent Data Leakage...")
     train_data_clean = train_df.drop(columns=["scenario"], errors='ignore')
@@ -468,43 +430,25 @@ def main():
         time_limit=None,
     )
 
-    # 7) leaderboard
     leaderboard = predictor.leaderboard(test_data_clean, silent=True)
     leaderboard_csv_path = os.path.join(run_dir, "leaderboard.csv")
     leaderboard.to_csv(leaderboard_csv_path, index=False)
-    print(f"Saved AutoGluon leaderboard to {leaderboard_csv_path}")
 
-    # 8) metrics on test (best model)
     y_true_test = test_df[label_col].values
-    
-    # Predict using clean dataset
     proba_best = predictor.predict_proba(test_data_clean)
-    
     if isinstance(proba_best, pd.DataFrame):
-        if 1 in proba_best.columns:
-            scores_best = proba_best[1].values
-        else:
-            scores_best = proba_best.iloc[:, 1].values
+        scores_best = proba_best.iloc[:, 1].values
     else:
         scores_best = np.asarray(proba_best)
 
     metrics_global = compute_metrics_from_scores(scores_best, y_true_test)
-    print("\nEvaluation on test split (best model):")
-    for k, v in metrics_global.items():
-        print(f"  {k}: {v}")
-
-    # 9) Saving the overall metrics
+    
     results = {
         "config": {
             "window_size": window_size,
             "stride": stride,
             "num_features": num_features,
             "label_col": label_col,
-            "note": "Leakage Fixed: 'scenario' column dropped before training."
-        },
-        "dataset_sizes": {
-            "num_windows_train": int(len(train_df)),
-            "num_windows_test": int(len(test_df)),
         },
         "metrics_test_best_model": metrics_global,
         "autogluon_path": ag_path,
@@ -513,10 +457,9 @@ def main():
     metrics_path = os.path.join(run_dir, "metrics_overall.json")
     with open(metrics_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Saved overall metrics to {metrics_path}")
 
-    # 10) Metrics for each model + learning curves
-    print("\nComputing per-model metrics and learning curves...")
+    # 10) Metrics for each model + FEATURE IMPORTANCE (con nomi veri)
+    print("\nComputing per-model metrics and feature importance...")
     thresholds = np.linspace(0.01, 0.99, 99)
     model_names = leaderboard["model"].tolist()
     comparison_rows = []
@@ -524,21 +467,18 @@ def main():
     for model_name in model_names:
         model_dir = os.path.join(ag_path, model_name)
         os.makedirs(model_dir, exist_ok=True)
+        print(f"Processing model: {model_name}")
 
-        # Train stats (Usiamo train_data_clean)
-        y_train_vals = train_df[label_col].values
         proba_train = predictor.predict_proba(train_data_clean, model=model_name)
-        scores_train = proba_train[1].values if isinstance(proba_train, pd.DataFrame) else np.asarray(proba_train)
+        scores_train = proba_train.iloc[:, 1].values
 
         metrics_train, _ = compute_bce_losses_and_metrics(
-            y_true=y_train_vals,
+            y_true=train_df[label_col].values,
             scores=scores_train,
-            thresholds_for_curve=None,
         )
 
-        # Test stats (Usiamo test_data_clean)
         proba_test = predictor.predict_proba(test_data_clean, model=model_name)
-        scores_test = proba_test[1].values if isinstance(proba_test, pd.DataFrame) else np.asarray(proba_test)
+        scores_test = proba_test.iloc[:, 1].values
 
         metrics_test, lc_test = compute_bce_losses_and_metrics(
             y_true=y_true_test,
@@ -546,19 +486,19 @@ def main():
             thresholds_for_curve=thresholds,
         )
 
-        # save metrics JSON
-        per_model_metrics = {
-            "train": metrics_train,
-            "test": metrics_test,
-        }
+        per_model_metrics = {"train": metrics_train, "test": metrics_test}
         with open(os.path.join(model_dir, "metrics_train_test.json"), "w") as f:
             json.dump(per_model_metrics, f, indent=2)
 
-        # save learning curve CSV
         if lc_test is not None:
             lc_test.to_csv(os.path.join(model_dir, "learning_curve_test.csv"), index=False)
 
-        # row for comparison CSV 
+        # Feature importance 
+        fi_df = predictor.feature_importance(test_data_clean, model=model_name)
+        fi_path = os.path.join(model_dir, "feature_importance.csv")
+        fi_df.to_csv(fi_path)
+        print(f"     Saved feature importance to {fi_path}")
+
         comparison_rows.append({
             "model": model_name,
             "bce_loss_overall": metrics_test["bce_loss_overall"],
