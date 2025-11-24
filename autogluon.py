@@ -194,7 +194,7 @@ def compute_bce_losses_and_metrics(y_true, scores, thresholds_for_curve=None):
         "accuracy_at_0.5": acc_05,
     }
 
-    # --- LEARNING CURVE DATA (Threshold Curve) ---
+    # Learining curve data
     learning_curve = None
     if thresholds_for_curve is not None:
         thresholds_for_curve = np.asarray(thresholds_for_curve)
@@ -293,7 +293,6 @@ def build_window_dataframe_stats(
         # That means it filled up from the first records and ignored the last ones.
         # Improved logic: Collect all possible starts, then sample.
         
-        # ... keeping original logic structure but adding checks ...
         
         if max_windows is not None and len(starts) > max_windows:
             # Note: This sampling is per-record in the loop? 
@@ -366,7 +365,6 @@ def main():
     velocity_records = list(ds.sets.get("velocity", []))
 
     # Combine base train and control for the "normal" class
-    # (Assuming control is also normal driving)
     train_group_records = base_train_records + control_records
 
     print(f"Number of training/normal records: {len(train_group_records)}")
@@ -380,22 +378,19 @@ def main():
     label_col = "is_anomaly"
     
     # Configuration for subsampling windows
-    max_windows_train_per_scenario = 4000  # Limit for training set
-    max_windows_test_per_scenario = None   # No limit for test set (evaluate on everything)
+    max_windows_train_per_scenario = 4000
+    max_windows_test_per_scenario = None
 
-    # 1) Compute min/max ONLY on the training records (to avoid leakage)
+    # 1) Compute min/max ONLY on the training records
     print("Computing global min/max over the training set...")
     feat_min, feat_max = compute_minmax(train_group_records, num_features=num_features)
 
     # 2) Normalize ALL records
-    # We can normalize everything now, splitting happens later.
-    # Normalization itself is safe because parameters came only from train records.
     train_norm = normalize_records(train_group_records, feat_min, feat_max, num_features=num_features)
     collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features=num_features)
     weight_norm = normalize_records(weight_records, feat_min, feat_max, num_features=num_features)
     velocity_norm = normalize_records(velocity_records, feat_min, feat_max, num_features=num_features)
 
-    # Dictionary to iterate easily
     scenario_data = {
         "normal": train_norm,
         "collision": collision_norm,
@@ -403,21 +398,16 @@ def main():
         "velocity": velocity_norm
     }
 
-    print("\n--- STARTING DATA SPLIT (LEAKAGE FIX) ---")
-    print("Splitting RECORDS into Train/Test sets BEFORE creating windows.")
-    print("This ensures no window in Test comes from the same recording as Train.")
-
+    print("\n--- STARTING DATA SPLIT ---")
+    
     train_dfs = []
     test_dfs = []
 
-    # 3) Split records -> Build Windows -> Collect
+    # 3) Split records -> Build Windows
     for name, records in scenario_data.items():
         if len(records) == 0:
             continue
             
-        # SPLIT THE LIST OF RECORDS (Raw Data Level)
-        # If there is only 1 record, we cannot split it effectively 70/30 without leakage.
-        # We assign single records to Test to be safe, or duplicate (here we put in Train if len=1)
         if len(records) > 1:
             recs_train, recs_test = train_test_split(records, test_size=0.3, random_state=42)
         else:
@@ -427,7 +417,6 @@ def main():
 
         print(f"Scenario '{name}': {len(recs_train)} recs for Train, {len(recs_test)} recs for Test.")
 
-        # Build windows for TRAIN portion
         df_tr = build_window_dataframe_stats(
             recs_train,
             window_size=window_size,
@@ -440,8 +429,6 @@ def main():
         )
         train_dfs.append(df_tr)
 
-        # Build windows for TEST portion
-        # Note: We usually want ALL test windows to evaluate properly, so max_windows=None
         df_te = build_window_dataframe_stats(
             recs_test,
             window_size=window_size,
@@ -454,11 +441,10 @@ def main():
         )
         test_dfs.append(df_te)
 
-    # 4) Concatenate to create final Train/Test DataFrames
+    # 4) Concatenate
     train_df = pd.concat(train_dfs, axis=0, ignore_index=True)
     test_df = pd.concat(test_dfs, axis=0, ignore_index=True)
 
-    # Shuffle rows (optional, but good for training batches)
     train_df = train_df.sample(frac=1, random_state=42).reset_index(drop=True)
     test_df = test_df.sample(frac=1, random_state=42).reset_index(drop=True)
 
@@ -466,32 +452,33 @@ def main():
     print(f"  Train Windows: {len(train_df)} | Anomaly Rate: {train_df[label_col].mean():.2f}")
     print(f"  Test Windows : {len(test_df)}  | Anomaly Rate: {test_df[label_col].mean():.2f}")
 
-    # -------------------------------------------------------
-    # AUTO GLUON SECTION (Unchanged logic, just using new DFs)
-    # -------------------------------------------------------
+    print("\n[SECURITY] Dropping 'scenario' column to prevent Data Leakage...")
+    train_data_clean = train_df.drop(columns=["scenario"], errors='ignore')
+    test_data_clean = test_df.drop(columns=["scenario"], errors='ignore')
     
     ag_path = os.path.join(run_dir, "AutogluonModels")
-
     predictor = TabularPredictor(
         label=label_col,
         problem_type="binary",
         eval_metric="roc_auc",
         path=ag_path,
     ).fit(
-        train_data=train_df,
+        train_data=train_data_clean, 
         presets="medium_quality_faster_train",
         time_limit=None,
     )
 
-    # 7) leaderboard 
-    leaderboard = predictor.leaderboard(test_df, silent=True)
+    # 7) leaderboard
+    leaderboard = predictor.leaderboard(test_data_clean, silent=True)
     leaderboard_csv_path = os.path.join(run_dir, "leaderboard.csv")
     leaderboard.to_csv(leaderboard_csv_path, index=False)
     print(f"Saved AutoGluon leaderboard to {leaderboard_csv_path}")
 
     # 8) metrics on test (best model)
     y_true_test = test_df[label_col].values
-    proba_best = predictor.predict_proba(test_df)
+    
+    # Predict using clean dataset
+    proba_best = predictor.predict_proba(test_data_clean)
     
     if isinstance(proba_best, pd.DataFrame):
         if 1 in proba_best.columns:
@@ -513,7 +500,7 @@ def main():
             "stride": stride,
             "num_features": num_features,
             "label_col": label_col,
-            "note": "Splitting done by RECORD, not by window (Leakage Fixed)"
+            "note": "Leakage Fixed: 'scenario' column dropped before training."
         },
         "dataset_sizes": {
             "num_windows_train": int(len(train_df)),
@@ -535,13 +522,12 @@ def main():
     comparison_rows = []
 
     for model_name in model_names:
-        # print(f"  -> Model: {model_name}")
         model_dir = os.path.join(ag_path, model_name)
         os.makedirs(model_dir, exist_ok=True)
 
-        # Train stats
+        # Train stats (Usiamo train_data_clean)
         y_train_vals = train_df[label_col].values
-        proba_train = predictor.predict_proba(train_df, model=model_name)
+        proba_train = predictor.predict_proba(train_data_clean, model=model_name)
         scores_train = proba_train[1].values if isinstance(proba_train, pd.DataFrame) else np.asarray(proba_train)
 
         metrics_train, _ = compute_bce_losses_and_metrics(
@@ -550,8 +536,8 @@ def main():
             thresholds_for_curve=None,
         )
 
-        # Test stats
-        proba_test = predictor.predict_proba(test_df, model=model_name)
+        # Test stats (Usiamo test_data_clean)
+        proba_test = predictor.predict_proba(test_data_clean, model=model_name)
         scores_test = proba_test[1].values if isinstance(proba_test, pd.DataFrame) else np.asarray(proba_test)
 
         metrics_test, lc_test = compute_bce_losses_and_metrics(
