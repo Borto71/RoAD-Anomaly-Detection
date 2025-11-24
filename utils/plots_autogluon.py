@@ -31,17 +31,28 @@ def plot_confusion_matrix(model_name, model_dir, run_dir):
         with open(json_path, 'r') as f:
             metrics = json.load(f)
         
+        # --- MODIFICA QUI: Recuperiamo il best threshold dal JSON ---
+        # Nota: la struttura salvata in autogluon.py è {"train": ..., "test": ...}
+        best_thr = metrics.get("test", {}).get("best_threshold", 0.5)
+        
         acc0 = None 
         acc1 = None 
         
-        # Try finding acc0/acc1 in CSV if not present in generic metrics
+        # Leggiamo il CSV per trovare le accuratezze a quella specifica soglia
         lc_path = os.path.join(model_dir, LC_CSV_NAME)
         if os.path.exists(lc_path):
             lc_df = pd.read_csv(lc_path)
-            row = lc_df.iloc[(lc_df['threshold'] - 0.5).abs().argsort()[:1]]
+            
+            # --- MODIFICA QUI: Cerchiamo la riga più vicina al best_thr invece che a 0.5 ---
+            row = lc_df.iloc[(lc_df['threshold'] - best_thr).abs().argsort()[:1]]
+            
             if not row.empty:
                 acc0 = row['accuracy_class0'].values[0]
                 acc1 = row['accuracy_class1'].values[0]
+                # Aggiorniamo il threshold usato per il plot con quello reale trovato nel CSV (per precisione)
+                used_thr = row['threshold'].values[0]
+            else:
+                used_thr = best_thr
 
         if acc0 is not None and acc1 is not None:
             cm_norm = np.array([[acc0, 1 - acc0], [1 - acc1, acc1]])
@@ -52,13 +63,14 @@ def plot_confusion_matrix(model_name, model_dir, run_dir):
                         yticklabels=["True Normal (0)", "True Anomaly (1)"],
                         ax=ax, annot_kws={"size": 14})
             
-            ax.set_title(f'Normalized CM (Thr=0.5)\n{model_name}', fontsize=14)
+            # --- MODIFICA QUI: Titolo dinamico con il valore della soglia ---
+            ax.set_title(f'Normalized CM (Best Thr={used_thr:.3f})\n{model_name}', fontsize=14)
             plt.tight_layout()
             
             cm_path = os.path.join(model_dir, "confusion_matrix_norm.png")
             plt.savefig(cm_path)
             plt.close(fig)
-            print(f"     Saved confusion matrix to {cm_path}")
+            print(f"     Saved confusion matrix to {cm_path} using threshold {used_thr:.3f}")
             
     except Exception as e:
         print(f"Error plotting CM for {model_name}: {e}")
