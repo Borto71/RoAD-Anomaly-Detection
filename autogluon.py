@@ -30,6 +30,7 @@ def minmax_scale(arr, min_vals, max_vals, eps=1e-8):
     arr = arr.astype(np.float32)
     num = arr - min_vals
     den = (max_vals - min_vals) + eps
+    # The normalization uses stats computed ONLY on training data (correct practice to prevent leakage)
     return 2.0 * (num / den) - 1.0
 
 # Normalize records
@@ -337,7 +338,11 @@ def main():
     print(f"Number of collision records:       {len(collision_records)}")
 
     window_size = 256
-    stride = 128
+    # Stride for training windows (overlap is fine/desired for training augmentation)
+    train_stride = 128 
+    # Stride for test windows (must be equal to window_size to prevent overlap/leakage)
+    test_stride = window_size # <-- CORRECTION: Eliminates window overlap in the test set.
+    
     num_features = 86
     label_col = "is_anomaly"
     
@@ -345,10 +350,12 @@ def main():
     max_windows_test_per_scenario = None
 
     # 1) Compute min/max
+    # This step is critical: it calculates normalization stats ONLY on training data (no leakage).
     print("Computing global min/max over the training set...")
     feat_min, feat_max = compute_minmax(train_group_records, num_features=num_features)
 
     # 2) Normalize
+    # Normalization of ALL sets uses the training set's min/max (no leakage).
     train_norm = normalize_records(train_group_records, feat_min, feat_max, num_features=num_features)
     collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features=num_features)
     weight_norm = normalize_records(weight_records, feat_min, feat_max, num_features=num_features)
@@ -371,6 +378,7 @@ def main():
         if len(records) == 0:
             continue
             
+        # Record-level split is good practice (prevents direct training/test data contamination).
         if len(records) > 1:
             recs_train, recs_test = train_test_split(records, test_size=0.3, random_state=42)
         else:
@@ -378,10 +386,11 @@ def main():
             recs_test = []
 
         
+        # Build TRAIN windows (with overlap: stride=128)
         df_tr = build_window_dataframe_stats(
             recs_train,
             window_size=window_size,
-            stride=stride,
+            stride=train_stride,
             num_features=num_features,
             label_col_name=label_col,
             scenario_name=name,
@@ -391,10 +400,12 @@ def main():
         )
         train_dfs.append(df_tr)
 
+        # Build TEST windows (NO overlap: stride=window_size=256)
+        # This resolves the indirect data leakage and provides an honest performance estimate.
         df_te = build_window_dataframe_stats(
             recs_test,
             window_size=window_size,
-            stride=stride,
+            stride=test_stride, 
             num_features=num_features,
             label_col_name=label_col,
             scenario_name=name,
@@ -414,6 +425,7 @@ def main():
     print(f"  Train Windows: {len(train_df)}")
     print(f"  Test Windows : {len(test_df)}")
 
+    # Target Leakage prevention: 'scenario' is dropped as it is highly correlated with 'is_anomaly'
     print("\n[SECURITY] Dropping 'scenario' column to prevent Data Leakage...")
     train_data_clean = train_df.drop(columns=["scenario"], errors='ignore')
     test_data_clean = test_df.drop(columns=["scenario"], errors='ignore')
@@ -446,7 +458,8 @@ def main():
     results = {
         "config": {
             "window_size": window_size,
-            "stride": stride,
+            "train_stride": train_stride,
+            "test_stride": test_stride, # Now includes both strides in the output config
             "num_features": num_features,
             "label_col": label_col,
         },
