@@ -63,7 +63,6 @@ def plot_confusion_matrix(model_name, model_dir, run_dir):
                         yticklabels=["True Normal (0)", "True Anomaly (1)"],
                         ax=ax, annot_kws={"size": 14})
             
-            # --- MODIFICA QUI: Titolo dinamico con il valore della soglia ---
             ax.set_title(f'Normalized CM (Best Thr={used_thr:.3f})\n{model_name}', fontsize=14)
             plt.tight_layout()
             
