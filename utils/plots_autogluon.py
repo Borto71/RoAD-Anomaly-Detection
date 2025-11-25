@@ -31,25 +31,23 @@ def plot_confusion_matrix(model_name, model_dir, run_dir):
         with open(json_path, 'r') as f:
             metrics = json.load(f)
         
-        # --- MODIFICA QUI: Recuperiamo il best threshold dal JSON ---
-        # Nota: la struttura salvata in autogluon.py è {"train": ..., "test": ...}
         best_thr = metrics.get("test", {}).get("best_threshold", 0.5)
         
         acc0 = None 
         acc1 = None 
         
-        # Leggiamo il CSV per trovare le accuratezze a quella specifica soglia
+        # Reading the CSV 
         lc_path = os.path.join(model_dir, LC_CSV_NAME)
         if os.path.exists(lc_path):
             lc_df = pd.read_csv(lc_path)
             
-            # --- MODIFICA QUI: Cerchiamo la riga più vicina al best_thr invece che a 0.5 ---
+            # Closest row to 0.5
             row = lc_df.iloc[(lc_df['threshold'] - best_thr).abs().argsort()[:1]]
             
             if not row.empty:
                 acc0 = row['accuracy_class0'].values[0]
                 acc1 = row['accuracy_class1'].values[0]
-                # Aggiorniamo il threshold usato per il plot con quello reale trovato nel CSV (per precisione)
+                # Updating 
                 used_thr = row['threshold'].values[0]
             else:
                 used_thr = best_thr
