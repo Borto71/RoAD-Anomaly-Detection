@@ -2,331 +2,417 @@ import os
 import time
 import json
 import numpy as np
-import torch
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
 
-# Custom imports
+# Import your dataset
 from RoADDataset import Dataset as RoADDataset
-from models.cnn_1d import build_model
 
-# ---------------------------------------------------------
-# 1. DATASET WINDOWING
-# ---------------------------------------------------------
-class RoADWindowedDataset(Dataset):
-    def __init__(self, records, window_size, stride, num_features=86, include_label=False):
-        """
-        Creates sliding windows from the list of records.
-        """
-        self.records = records
-        self.window_size = window_size
-        self.stride = stride
-        self.num_features = num_features
-        self.include_label = include_label
-        self.index_map = [] 
+# --- Configuration ---
+WINDOW_SIZE = 256
+TRAIN_STRIDE = 128
+TEST_STRIDE = 256
+NUM_FEATURES = 86
+BATCH_SIZE = 64
+EPOCHS = 20
+LEARNING_RATE = 0.001
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Build an index map to handle multiple recordings of different lengths
-        for rec_idx, arr in enumerate(records):
-            N = arr.shape[0]
-            if N < window_size: continue
-            for start in range(0, N - window_size + 1, stride):
-                self.index_map.append((rec_idx, start))
+# --- Helper Functions ---
 
-    def __len__(self): 
-        return len(self.index_map)
-    
-    def __getitem__(self, idx): 
-        rec_idx, start = self.index_map[idx]
-        arr = self.records[rec_idx]
-        
-        # Extract window and transpose to (Channels, Time) for PyTorch Conv1d
-        window_data = arr[start : start + self.window_size, :self.num_features]
-        x_tensor = torch.from_numpy(window_data.T.astype(np.float32)) 
-
-        if not self.include_label:
-            return x_tensor
-
-        # If labels are present (usually the last column), check if any anomaly exists in the window
-        if arr.shape[1] > self.num_features:
-            window_labels = arr[start : start + self.window_size, self.num_features]
-            label_value = 1.0 if window_labels.max() > 0 else 0.0
-        else:
-            label_value = 0.0
-            
-        return x_tensor, torch.tensor(label_value, dtype=torch.float32)
-
-# ---------------------------------------------------------
-# 2. UTILS
-# ---------------------------------------------------------
-def compute_minmax_incremental(train_records, num_features=86):
-    """
-    Computes global min and max across all training records incrementally
-    to avoid loading everything into memory at once.
-    """
-    print("Computing Min/Max incrementally...")
-    global_min = np.full(num_features, np.inf, dtype=np.float32)
-    global_max = np.full(num_features, -np.inf, dtype=np.float32)
-    
-    for rec in train_records:
-        arr = np.asarray(rec)[:, :num_features]
-        if arr.shape[0] == 0: continue
-        global_min = np.minimum(global_min, arr.min(axis=0))
-        global_max = np.maximum(global_max, arr.max(axis=0))
-        
-    return global_min, global_max
+def compute_minmax(train_records, num_features=86):
+    arrays = [np.asarray(rec)[:, :num_features] for rec in train_records]
+    big = np.concatenate(arrays, axis=0)
+    feat_min = big.min(axis=0).astype(np.float32)
+    feat_max = big.max(axis=0).astype(np.float32)
+    return feat_min, feat_max
 
 def normalize_records(records, feat_min, feat_max, num_features=86):
-    """
-    Normalizes features to the range [-1, 1].
-    """
     norm_recs = []
     eps = 1e-8
     den = (feat_max - feat_min) + eps
-    
     for rec in records:
         arr = np.asarray(rec)
-        feats = arr[:, :num_features]
-        # Scale to [-1, 1]
+        feats = arr[:, :num_features].astype(np.float32)
         feats_scaled = 2.0 * ((feats - feat_min) / den) - 1.0
         
-        # Keep labels untouched if they exist
         if arr.shape[1] > num_features:
-            arr_scaled = np.concatenate([feats_scaled, arr[:, num_features:]], axis=1)
+            label = arr[:, num_features : num_features + 1]
+            arr_scaled = np.concatenate([feats_scaled, label], axis=1)
         else:
             arr_scaled = feats_scaled
         norm_recs.append(arr_scaled)
-        
     return norm_recs
 
-def compute_center(train_loader, model, device):
-    """
-    Initializes the hypersphere center 'c' for Deep SVDD 
-    by taking the mean of the embeddings from the initial forward pass.
-    """
-    print("Computing Deep SVDD center c...")
-    model.eval()
-    
-    # Dummy pass to get output shape
-    dummy = torch.zeros(1, 86, 256).to(device)
-    c = torch.zeros(model.forward_features(dummy).shape[1]).to(device)
-    n_samples = 0
-    
-    with torch.no_grad():
-        for x in train_loader:
-            x = x.to(device)
-            z = model.forward_features(x)
-            c += z.sum(dim=0)
-            n_samples += z.shape[0]
+def create_sequences(records, window_size, stride, num_features, label_col_idx=86, max_windows=None):
+    X_list = []
+    y_list = []
+    total_windows = 0
+    for arr in records:
+        N = arr.shape[0]
+        if N < window_size: continue
+        
+        feats = arr[:, :num_features]
+        labels = arr[:, label_col_idx] if arr.shape[1] > num_features else np.zeros(N)
+        
+        starts = range(0, N - window_size + 1, stride)
+        for start in starts:
+            end = start + window_size
+            seq = feats[start:end, :]
+            label = 1 if labels[start:end].max() > 0 else 0
             
-    c /= n_samples
-    
-    # Avoid zero values to prevent numerical instability
-    c[(abs(c) < 0.1) & (c < 0)] = -0.1
-    c[(abs(c) < 0.1) & (c > 0)] = 0.1
-    
-    return c.detach()
+            X_list.append(seq)
+            y_list.append(label)
+            total_windows += 1
+            if max_windows and total_windows >= max_windows: break
+        if max_windows and total_windows >= max_windows: break
+            
+    if not X_list:
+        return np.array([]), np.array([])
+    return np.stack(X_list), np.array(y_list)
 
-# ---------------------------------------------------------
-# 3. FEATURE IMPORTANCE (PERMUTATION)
-# ---------------------------------------------------------
-def compute_permutation_importance(model, loader, c, device, feature_names=None):
+def compute_metrics_and_curves(y_true, scores, thresholds=None):
+    y_true = np.asarray(y_true).astype(int)
+    scores = np.asarray(scores).astype(float)
+    
+    roc_auc = roc_auc_score(y_true, scores)
+    pr_auc = average_precision_score(y_true, scores)
+    
+    eps = 1e-7
+    p = np.clip(scores, eps, 1 - eps)
+    bce = -(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
+    
+    best_f1 = 0
+    best_thr = 0.5
+    search_thrs = np.linspace(0, 1, 100)
+    for thr in search_thrs:
+        pred = (scores >= thr).astype(int)
+        _, _, f1, _ = precision_recall_fscore_support(y_true, pred, average='binary', zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = thr
+            
+    pred_05 = (scores >= 0.5).astype(int)
+    _, _, f1_05, _ = precision_recall_fscore_support(y_true, pred_05, average='binary', zero_division=0)
+    acc_05 = (pred_05 == y_true).mean()
+    
+    metrics = {
+        "auc_roc": float(roc_auc),
+        "pr_auc": float(pr_auc),
+        "bce_loss_overall": float(bce.mean()),
+        "bce_loss_class0": float(bce[y_true == 0].mean()) if (y_true==0).any() else 0.0,
+        "bce_loss_class1": float(bce[y_true == 1].mean()) if (y_true==1).any() else 0.0,
+        "best_f1": float(best_f1),
+        "test_threshold": float(best_thr),
+        "f1_at_0.5": float(f1_05),
+        "accuracy_at_0.5": float(acc_05)
+    }
+    
+    lc_df = None
+    if thresholds is not None:
+        data = []
+        total_neg = (y_true == 0).sum()
+        total_pos = (y_true == 1).sum()
+        for thr in thresholds:
+            pred = (scores >= thr).astype(int)
+            acc = (pred == y_true).mean()
+            _, _, f1, _ = precision_recall_fscore_support(y_true, pred, average='binary', zero_division=0)
+            tn = ((y_true == 0) & (pred == 0)).sum()
+            tp = ((y_true == 1) & (pred == 1)).sum()
+            acc0 = tn / total_neg if total_neg > 0 else 0
+            acc1 = tp / total_pos if total_pos > 0 else 0
+            data.append({
+                "threshold": thr,
+                "accuracy_overall": acc,
+                "f1_score": f1,
+                "accuracy_class0": acc0,
+                "accuracy_class1": acc1
+            })
+        lc_df = pd.DataFrame(data)
+        
+    return metrics, lc_df
+
+# --- Permutation Importance Function ---
+
+def compute_permutation_importance(model, X_test, y_test, baseline_score, feature_names, device, batch_size=64):
     """
-    Calculates feature importance by shuffling one channel at a time
-    and measuring the increase in Loss (distance from center).
-    Higher loss increase = more important feature.
+    Computes feature importance by shuffling one feature at a time and measuring score drop.
     """
-    print("\nComputing Permutation Feature Importance...")
+    print("\nComputing Permutation Importance (this may take a while)...")
     model.eval()
-    
-    # 1. Compute Base Loss (using a subset for speed)
-    original_losses = []
-    inputs = []
-    
-    max_batches = 10 
-    with torch.no_grad():
-        for i, batch in enumerate(loader):
-            if i >= max_batches: break
-            if isinstance(batch, list): x = batch[0]
-            else: x = batch
-            x = x.to(device)
-            inputs.append(x)
-            
-            z = model.forward_features(x)
-            loss = ((z - c) ** 2).sum(dim=1)
-            original_losses.append(loss.cpu().numpy())
-            
-    inputs = torch.cat(inputs, dim=0) # (N, C, T)
-    base_loss = np.concatenate(original_losses).mean()
-    
-    print(f"Base Loss: {base_loss:.6f}")
-    
     importances = []
-    num_features = inputs.shape[1] # C
     
-    for f_idx in range(num_features):
-        # Permutation: shuffle values of this channel across the batch
-        # This breaks the temporal and statistical structure of THIS specific feature
-        x_perm = inputs.clone()
-        idx = torch.randperm(x_perm.shape[0])
-        x_perm[:, f_idx, :] = x_perm[idx, f_idx, :] 
-        
+    # We use BCE Loss as the metric (higher increase = more important) or AUC drop
+    # Let's use AUC drop since it's robust.
+    
+    # X_test shape: (N_samples, Window_Size, Num_Features)
+    # We need to shuffle across the N_samples dimension for a specific feature index.
+    
+    n_features = X_test.shape[2] 
+    
+    # Ensure X_test is a copy so we don't mess up original data
+    X_test_np = np.array(X_test, copy=True)
+    
+    # Pre-compute y_test tensor once if possible, but we use dataloader usually.
+    # To be safe and consistent with main loop, let's just make a quick helper to get score
+    def get_score(X_in):
+        ds = SequenceDataset(X_in, y_test)
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
+        all_scores = []
         with torch.no_grad():
-            z = model.forward_features(x_perm)
-            loss = ((z - c) ** 2).sum(dim=1).mean().item()
+            for inputs, _ in dl:
+                inputs = inputs.to(device)
+                out = model(inputs)
+                all_scores.extend(out.cpu().numpy())
+        return roc_auc_score(y_test, all_scores)
+
+    for i in range(n_features):
+        # 1. Save original column
+        original_col = X_test_np[:, :, i].copy()
         
-        # Importance = how much the loss increased
-        imp = loss - base_loss
+        # 2. Shuffle column across samples
+        # We shuffle the 'samples' axis. The window structure for that feature stays intact per sample? 
+        # Actually, standard permutation importance shuffles the feature across the dataset.
+        # Since this is time-series windowed, if we shuffle 'feature i' across windows, 
+        # we break the correlation of feature i with the label for that window.
+        np.random.shuffle(X_test_np[:, :, i]) 
+        
+        # 3. Predict & Score
+        perm_score = get_score(X_test_np)
+        
+        # 4. Importance = Baseline - Permuted (Positive means feature was good)
+        imp = baseline_score - perm_score
         importances.append(imp)
         
-        if (f_idx+1) % 10 == 0:
-            print(f"Processed feature {f_idx+1}/{num_features}...")
-
-    # Save results to dataframe
-    if feature_names is None or len(feature_names) != num_features:
-        feature_names = [f"feat_{i}" for i in range(num_features)]
+        # 5. Restore
+        X_test_np[:, :, i] = original_col
         
-    df_imp = pd.DataFrame({
-        "feature": feature_names,
+        if (i+1) % 10 == 0:
+            print(f"Processed {i+1}/{n_features} features...")
+
+    # Create DataFrame
+    if feature_names and len(feature_names) == n_features:
+        names = feature_names
+    else:
+        names = [f"f{k}" for k in range(n_features)]
+        
+    fi_df = pd.DataFrame({
+        "feature": names,
         "importance": importances
     })
-    df_imp = df_imp.sort_values(by="importance", ascending=False)
-    return df_imp
+    fi_df = fi_df.sort_values(by="importance", ascending=False).reset_index(drop=True)
+    
+    # Normalize for easier plotting (0-1 range or relative)
+    # fi_df['importance'] = fi_df['importance'] / fi_df['importance'].sum()
+    
+    return fi_df
 
-# ---------------------------------------------------------
-# 4. TRAINING & SAVE LOGIC
-# ---------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, c, device):
-    model.train()
-    total_loss = 0.0
-    n = 0
-    for x in loader:
-        x = x.to(device)
-        optimizer.zero_grad()
-        
-        # Deep SVDD Loss: Minimize distance to center c
-        z = model.forward_features(x)
-        loss = ((z - c)**2).sum(dim=1).mean()
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        n += 1
-    return total_loss / max(1, n)
+# --- PyTorch Dataset & Model ---
 
-def collect_inference_results(model, loader, c, device):
-    """
-    Runs the model on the entire dataset and returns scores and labels.
-    """
-    model.eval()
-    scores, labels = [], []
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            z = model.forward_features(x)
-            # Anomaly score is the squared distance from center
-            dist = ((z - c)**2).sum(dim=1)
-            scores.append(dist.cpu().numpy())
-            labels.append(y.numpy())
-            
-    if len(scores) == 0: return np.array([]), np.array([])
-    return np.concatenate(scores), np.concatenate(labels)
+class SequenceDataset(Dataset):
+    def __init__(self, X, y):
+        # Permute X to (N, Features, Time) for PyTorch Conv1D
+        self.X = torch.FloatTensor(X).permute(0, 2, 1) 
+        self.y = torch.FloatTensor(y)
+        
+    def __len__(self):
+        return len(self.y)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+class Simple1DCNN(nn.Module):
+    def __init__(self, num_features, window_size):
+        super(Simple1DCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(in_channels=num_features, out_channels=32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x.squeeze()
+
+# --- Main Execution ---
 
 def main():
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join("runs_cnn", f"run_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
-    print(f"\nSaving outputs to: {run_dir}")
+    model_save_dir = os.path.join(run_dir, "Models", "CNN_1D")
+    os.makedirs(model_save_dir, exist_ok=True)
+    print(f"Saving outputs to: {model_save_dir}")
 
-    # Configuration
-    WINDOW_SIZE = 256
-    STRIDE = 128
-    NUM_FEAT = 86
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load Dataset
     ds = RoADDataset(normalize=False)
     
-    # Get feature names if available in the dataset object
-    feat_names = ds.feature_names if hasattr(ds, 'feature_names') else None
+    # Use Dataset feature names if available, else manual list
+    if hasattr(ds, 'feature_names') and len(ds.feature_names) == 86:
+        feature_names = ds.feature_names
+    else:
+        # Fallback list (same as autogluon.py)
+        feature_names = [f"feat_{i}" for i in range(86)] 
 
-    # Load & Normalize Data
-    train_recs = list(ds.sets["training"]) + list(ds.sets.get("control", []))
-    coll_recs = list(ds.sets.get("collision", []))
-    weight_recs = list(ds.sets.get("weight", []))
-    vel_recs = list(ds.sets.get("velocity", []))
+    base_train = list(ds.sets["training"])
+    control = list(ds.sets.get("control", []))
+    train_group = base_train + control
     
-    # Compute scaling parameters on training data only
-    fmin, fmax = compute_minmax_incremental(train_recs, NUM_FEAT)
-    
-    # Apply normalization
-    train_norm = normalize_records(train_recs, fmin, fmax)
-    coll_norm = normalize_records(coll_recs, fmin, fmax)
-    weight_norm = normalize_records(weight_recs, fmin, fmax)
-    vel_norm = normalize_records(vel_recs, fmin, fmax)
-    ctrl_norm = normalize_records(ds.sets.get("control", []), fmin, fmax)
-
-    # Data Loaders
-    train_loader = DataLoader(RoADWindowedDataset(train_norm, WINDOW_SIZE, STRIDE), batch_size=128, shuffle=True)
-    
-    # Build Model
-    model = build_model(in_channels=NUM_FEAT).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    
-    # Initialize Center
-    c = compute_center(train_loader, model, DEVICE)
-    
-    # Training Loop
-    best_loss = np.inf
-    for ep in range(1, 21): # Train for 20 epochs
-        loss = train_one_epoch(model, train_loader, optimizer, c, DEVICE)
-        print(f"Epoch {ep:02d} | Loss: {loss:.6f}")
-        
-        # Save best model checkpoint
-        if loss < best_loss:
-            best_loss = loss
-            ckpt = {"model": model.state_dict(), "c": c, "min": fmin, "max": fmax}
-            torch.save(ckpt, os.path.join(run_dir, "model_best.pt"))
-
-    # --- POST TRAINING EVALUATION ---
-    print("\nLoading best model for evaluation...")
-    ckpt = torch.load(os.path.join(run_dir, "model_best.pt"), weights_only = False) 
-    model.load_state_dict(ckpt["model"])
-    c = ckpt["c"]
-
-    # 1. Feature Importance
-    # We use the training set to understand what the model considers "normal" features
-    df_imp = compute_permutation_importance(model, train_loader, c, DEVICE, feature_names=feat_names)
-    df_imp.to_csv(os.path.join(run_dir, "feature_importance.csv"), index=False)
-    print(f"Feature importance saved.")
-
-    # 2. Inference on Test Sets
-    # Define scenarios: (Anomaly Records, Normal Records)
-    test_scenarios = {
-        "collision": (coll_norm, ctrl_norm), 
-        "weight": (weight_norm, ctrl_norm),
-        "velocity": (vel_norm, ctrl_norm)
+    others = {
+        "collision": list(ds.sets.get("collision", [])),
+        "weight": list(ds.sets.get("weight", [])),
+        "velocity": list(ds.sets.get("velocity", []))
     }
 
-    for name, (anom_recs, norm_recs) in test_scenarios.items():
-        if len(anom_recs) == 0: continue
-        
-        # Merge anomalies and normal controls for testing
-        full_recs = anom_recs + norm_recs
-        
-        # Create dataset and loader (using include_label=True for evaluation)
-        ds_test = RoADWindowedDataset(full_recs, WINDOW_SIZE, 256, include_label=True)
-        dl_test = DataLoader(ds_test, batch_size=256, shuffle=False)
-        
-        s, y = collect_inference_results(model, dl_test, c, DEVICE)
-        
-        # Save raw scores and labels for plotting later
-        res_path = os.path.join(run_dir, f"results_{name}.npz")
-        np.savez(res_path, scores=s, labels=y)
-        print(f"Saved results for {name} to {res_path}")
+    print("Computing normalization stats on training data...")
+    if len(train_group) == 0: raise ValueError("Training group is empty!")
+    feat_min, feat_max = compute_minmax(train_group, NUM_FEATURES)
+    
+    train_norm = normalize_records(train_group, feat_min, feat_max, NUM_FEATURES)
+    others_norm = {k: normalize_records(v, feat_min, feat_max, NUM_FEATURES) for k, v in others.items()}
 
-    print("\nDone. Run plots.py to visualize curves.")
+    X_train_list, y_train_list = [], []
+    X_test_list, y_test_list = [], []
+    
+    # Normal Data
+    if len(train_norm) > 1:
+        tr_recs, te_recs = train_test_split(train_norm, test_size=0.3, random_state=42)
+    else:
+        tr_recs, te_recs = train_norm, []
+        
+    xt, yt = create_sequences(tr_recs, WINDOW_SIZE, TRAIN_STRIDE, NUM_FEATURES, max_windows=4000)
+    xe, ye = create_sequences(te_recs, WINDOW_SIZE, TEST_STRIDE, NUM_FEATURES)
+    if len(xt)>0: X_train_list.append(xt); y_train_list.append(yt)
+    if len(xe)>0: X_test_list.append(xe); y_test_list.append(ye)
+
+    # Anomaly Data
+    for name, recs in others_norm.items():
+        if not recs: continue
+        if len(recs) > 1:
+            tr_recs, te_recs = train_test_split(recs, test_size=0.3, random_state=42)
+        else:
+            print(f"Warning: '{name}' has only {len(recs)} record(s). Using all for training.")
+            tr_recs = recs; te_recs = []
+        
+        xt, yt = create_sequences(tr_recs, WINDOW_SIZE, TRAIN_STRIDE, NUM_FEATURES, max_windows=4000)
+        xe, ye = create_sequences(te_recs, WINDOW_SIZE, TEST_STRIDE, NUM_FEATURES)
+        if len(xt)>0: X_train_list.append(xt); y_train_list.append(yt)
+        if len(xe)>0: X_test_list.append(xe); y_test_list.append(ye)
+            
+    if len(X_train_list) == 0: raise ValueError("No training data!")
+    X_train = np.concatenate(X_train_list)
+    y_train = np.concatenate(y_train_list)
+    
+    if len(X_test_list) > 0:
+        X_test = np.concatenate(X_test_list)
+        y_test = np.concatenate(y_test_list)
+    else:
+        print("Warning: No test data! Using Train as Test (Debugging only).")
+        X_test = X_train; y_test = y_train
+    
+    print(f"Train Shape: {X_train.shape}, Test Shape: {X_test.shape}")
+    
+    train_ds = SequenceDataset(X_train, y_train)
+    test_ds = SequenceDataset(X_test, y_test)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    
+    model = Simple1DCNN(NUM_FEATURES, WINDOW_SIZE).to(DEVICE)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    print("\nStarting Training...")
+    model.train()
+    for epoch in range(EPOCHS):
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {running_loss/len(train_loader):.4f}")
+        
+    print("\nEvaluating...")
+    model.eval()
+    
+    # Get predictions
+    train_scores, train_true = [], []
+    with torch.no_grad():
+        for inputs, labels in train_loader:
+            out = model(inputs.to(DEVICE))
+            train_scores.extend(out.cpu().numpy())
+            train_true.extend(labels.numpy())
+            
+    test_scores, test_true = [], []
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            out = model(inputs.to(DEVICE))
+            test_scores.extend(out.cpu().numpy())
+            test_true.extend(labels.numpy())
+            
+    metrics_train, _ = compute_metrics_and_curves(train_true, train_scores)
+    metrics_test, lc_test = compute_metrics_and_curves(test_true, test_scores, np.linspace(0.01, 0.99, 99))
+    
+    # --- CALCULATE FEATURE IMPORTANCE ---
+    # We use the test AUC as the baseline
+    baseline_auc = metrics_test["auc_roc"]
+    
+    # For speed, if test set is huge, sample it. Here we use full X_test.
+    fi_df = compute_permutation_importance(
+        model, X_test, y_test, 
+        baseline_score=baseline_auc, 
+        feature_names=feature_names, 
+        device=DEVICE,
+        batch_size=BATCH_SIZE
+    )
+    
+    # Save Outputs
+    fi_path = os.path.join(model_save_dir, "feature_importance.csv")
+    fi_df.to_csv(fi_path, index=True) # index is important if it holds names or just order
+    print(f"Saved feature importance to {fi_path}")
+
+    full_metrics = {"train": metrics_train, "test": metrics_test}
+    with open(os.path.join(model_save_dir, "metrics_train_test.json"), "w") as f:
+        json.dump(full_metrics, f, indent=2)
+        
+    if lc_test is not None:
+        lc_test.to_csv(os.path.join(model_save_dir, "learning_curve_test.csv"), index=False)
+        
+    torch.save(model.state_dict(), os.path.join(model_save_dir, "model.pth"))
+    
+    comp_row = {
+        "model": "CNN_1D",
+        "bce_loss_overall": metrics_test["bce_loss_overall"],
+        "accuracy_at_0.5": metrics_test["accuracy_at_0.5"],
+        "f1_at_0.5": metrics_test["f1_at_0.5"],
+        "best_f1": metrics_test["best_f1"],
+        "roc_auc": metrics_test["auc_roc"]
+    }
+    pd.DataFrame([comp_row]).to_csv(os.path.join(run_dir, "models_comparison_test.csv"), index=False)
+    print("Training finished. Outputs saved.")
 
 if __name__ == "__main__":
     main()

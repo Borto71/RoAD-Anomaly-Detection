@@ -1,166 +1,189 @@
 import os
 import glob
-import numpy as np
+import json
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import roc_curve, auc, precision_recall_fscore_support
+import numpy as np
 
 # Directory settings
 RUNS_BASE_DIR = "../runs_cnn"
+MODELS_PARENT_DIR = "Models"
+LC_CSV_NAME = "learning_curve_test.csv"
+COMP_CSV_NAME = "models_comparison_test.csv"
+METRICS_JSON_NAME = "metrics_train_test.json"
+FI_CSV_NAME = "feature_importance.csv"
 
 def find_latest_run_dir(base_dir):
-    """
-    Finds the most recent experiment folder based on the timestamp.
-    """
     run_dirs = glob.glob(os.path.join(base_dir, "run_*"))
-    if not run_dirs: return None
+    if not run_dirs:
+        print(f"Error: No run directories found in {base_dir}")
+        return None
     run_dirs.sort(reverse=True)
     return run_dirs[0]
 
-def plot_metrics_vs_threshold(scores, labels, scenario_name, output_dir):
-    """
-    Plots F1 Score, Accuracy Class 0 (Normal), and Accuracy Class 1 (Anomaly)
-    as a function of the anomaly score threshold.
-    """
-    print(f"  Generating Threshold Curves for {scenario_name}...")
-    
-    # Generate a range of thresholds between min and max scores
-    t_min, t_max = scores.min(), scores.max()
-    thresholds = np.linspace(t_min, t_max, 200) # 200 steps for a smooth curve
-    
-    f1_list = []
-    acc0_list = []
-    acc1_list = []
-    
-    for thr in thresholds:
-        # Predicted: 1 if score >= threshold, else 0
-        y_pred = (scores >= thr).astype(int)
-        
-        # Calculate Confusion Matrix elements manually
-        tp = ((labels == 1) & (y_pred == 1)).sum()
-        tn = ((labels == 0) & (y_pred == 0)).sum()
-        fp = ((labels == 0) & (y_pred == 1)).sum()
-        fn = ((labels == 1) & (y_pred == 0)).sum()
-        
-        # Specificity (Accuracy on Normals)
-        acc0 = tn / (tn + fp) if (tn + fp) > 0 else 0.0 
-        # Recall / Sensitivity (Accuracy on Anomalies)
-        acc1 = tp / (tp + fn) if (tp + fn) > 0 else 0.0 
-        
-        # F1 Score calculation
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = acc1
-        f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
-        
-        f1_list.append(f1)
-        acc0_list.append(acc0)
-        acc1_list.append(acc1)
-        
-    # Plotting
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    ax.plot(thresholds, f1_list, label='F1 Score', color='green', linewidth=2)
-    ax.plot(thresholds, acc0_list, label='Accuracy Class 0 (Normal)', color='blue', linestyle='--')
-    ax.plot(thresholds, acc1_list, label='Accuracy Class 1 (Anomaly)', color='orange', linestyle='--')
-    
-    # Highlight the Best F1 Score
-    best_idx = np.argmax(f1_list)
-    best_thr = thresholds[best_idx]
-    best_f1 = f1_list[best_idx]
-    
-    ax.scatter(best_thr, best_f1, color='black', zorder=5)
-    ax.text(best_thr, best_f1 + 0.02, f"Best F1: {best_f1:.2f}\nThr: {best_thr:.2f}", ha='center')
-    
-    ax.set_title(f'Metrics vs Threshold - {scenario_name.capitalize()}')
-    ax.set_xlabel('Anomaly Score Threshold (Distance^2)')
-    ax.set_ylabel('Score')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"curves_threshold_{scenario_name}.png"))
-    plt.close()
+def plot_confusion_matrix(model_name, model_dir):
+    json_path = os.path.join(model_dir, METRICS_JSON_NAME)
+    if not os.path.exists(json_path): return
 
-def plot_roc_curve(scores, labels, scenario_name, output_dir):
-    """
-    Plots the standard Receiver Operating Characteristic (ROC) curve.
-    """
-    fpr, tpr, _ = roc_curve(labels, scores)
-    roc_auc = auc(fpr, tpr)
-    
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.3f})')
-    ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    
-    ax.set_xlim([0.0, 1.0])
-    ax.set_ylim([0.0, 1.05])
-    ax.set_xlabel('False Positive Rate (1 - Acc Class 0)')
-    ax.set_ylabel('True Positive Rate (Acc Class 1)')
-    ax.set_title(f'ROC Curve - {scenario_name.capitalize()}')
-    ax.legend(loc="lower right")
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"roc_curve_{scenario_name}.png"))
-    plt.close()
+    try:
+        with open(json_path, 'r') as f:
+            metrics = json.load(f)
+        best_thr = metrics.get("test", {}).get("test_threshold", 0.5)
+        
+        acc0 = None; acc1 = None
+        lc_path = os.path.join(model_dir, LC_CSV_NAME)
+        used_thr = best_thr
+        
+        if os.path.exists(lc_path):
+            lc_df = pd.read_csv(lc_path)
+            row = lc_df.iloc[(lc_df['threshold'] - best_thr).abs().argsort()[:1]]
+            if not row.empty:
+                acc0 = row['accuracy_class0'].values[0]
+                acc1 = row['accuracy_class1'].values[0]
+                used_thr = row['threshold'].values[0]
 
-def plot_feature_importance(run_dir):
-    """
-    Reads the CSV generated during training and plots the top 20 features.
-    """
-    csv_path = os.path.join(run_dir, "feature_importance.csv")
-    if not os.path.exists(csv_path):
-        print("Feature importance CSV not found.")
-        return
+        if acc0 is not None and acc1 is not None:
+            cm_norm = np.array([[acc0, 1 - acc0], [1 - acc1, acc1]])
+            fig, ax = plt.subplots(figsize=(7, 6))
+            sns.heatmap(cm_norm, annot=True, fmt=".2%", cmap="Blues", cbar=False,
+                        xticklabels=["Pred Normal (0)", "Pred Anomaly (1)"],
+                        yticklabels=["True Normal (0)", "True Anomaly (1)"],
+                        ax=ax, annot_kws={"size": 14})
+            ax.set_title(f'Normalized CM (Best Thr={used_thr:.3f})\n{model_name}', fontsize=14)
+            plt.tight_layout()
+            plt.savefig(os.path.join(model_dir, "confusion_matrix_norm.png"))
+            plt.close(fig)
+            print(f"     Saved confusion matrix.")
+            
+    except Exception as e:
+        print(f"Error plotting CM for {model_name}: {e}")
 
-    df = pd.read_csv(csv_path)
+def plot_learning_curves(model_name, model_dir):
+    lc_path = os.path.join(model_dir, LC_CSV_NAME)
+    fi_path = os.path.join(model_dir, FI_CSV_NAME)
     
-    # Select top 20 and sort ascending for the horizontal bar chart
-    top_df = df.head(20).sort_values(by="importance", ascending=True) 
+    if not os.path.exists(lc_path): return
+
+    try:
+        lc_df = pd.read_csv(lc_path)
+    except Exception as e:
+        print(f"Error reading learning curve CSV: {e}"); return
+
+    print(f"  -> Plotting metrics for {model_name}")
+
+    required_cols = ['f1_score', 'accuracy_class0', 'accuracy_class1']
+    has_extended_metrics = all(col in lc_df.columns for col in required_cols)
+
+    if has_extended_metrics:
+        fig, axs = plt.subplots(2, 2, figsize=(16, 10))
+        fig.suptitle(f'Metrics & Permutation Importance - {model_name}', fontsize=16)
+        
+        line_plots_config = [
+            (0, 0, 'f1_score', 'F1 Score', 'tab:green'),
+            (1, 0, 'accuracy_class0', 'Accuracy Class 0 (Normal)', 'tab:blue'),
+            (1, 1, 'accuracy_class1', 'Accuracy Class 1 (Anomaly)', 'tab:orange')
+        ]
+        
+        for r, c, col, title, color in line_plots_config:
+            ax = axs[r, c]
+            if col in lc_df.columns:
+                ax.plot(lc_df['threshold'], lc_df[col], color=color, linewidth=2)
+                ax.set_title(title)
+                ax.set_xlabel('Threshold')
+                ax.set_ylabel('Score')
+                ax.grid(True, linestyle='--', alpha=0.5)
+                ax.set_ylim(-0.05, 1.05)
+                
+                max_idx = lc_df[col].idxmax()
+                max_val = lc_df[col].max()
+                max_thr = lc_df['threshold'].iloc[max_idx]
+                ax.scatter(max_thr, max_val, color='black', zorder=5, s=30)
+                ax.text(max_thr, max_val, f' Max: {max_val:.3f}', fontsize=9, verticalalignment='bottom')
+
+        # Feature Importance Plot (Permutation)
+        ax_fi = axs[0, 1]
+        
+        if os.path.exists(fi_path):
+            try:
+                fi_df = pd.read_csv(fi_path)
+                # Ensure we have the right columns
+                if 'feature' in fi_df.columns and 'importance' in fi_df.columns:
+                    fi_top = fi_df.sort_values(by='importance', ascending=False).head(10)
+                    fi_top = fi_top.iloc[::-1] # Invert for plotting
+                    
+                    y_pos = np.arange(len(fi_top))
+                    
+                    ax_fi.barh(y_pos, fi_top['importance'], color='tab:purple', alpha=0.8)
+                    ax_fi.set_yticks(y_pos)
+                    ax_fi.set_yticklabels(fi_top['feature'], fontsize=10)
+                    
+                    ax_fi.set_title('Top 10 Feature Importance (Permutation)')
+                    ax_fi.set_xlabel('AUC Drop when permuted')
+                    ax_fi.grid(axis='x', linestyle='--', alpha=0.5)
+                else:
+                    ax_fi.text(0.5, 0.5, 'CSV format invalid', ha='center')
+            except Exception as e:
+                print(f"Error plotting feature importance: {e}")
+                ax_fi.text(0.5, 0.5, 'Error loading FI data', ha='center')
+        else:
+            ax_fi.text(0.5, 0.5, 'Feature Importance CSV missing', ha='center')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plot_path = os.path.join(model_dir, "detailed_metrics_vs_threshold.png")
+        plt.savefig(plot_path)
+        plt.close(fig)
+
+def plot_model_comparison(comp_df, run_dir):
+    model_names = comp_df['model'].tolist()
+    metrics = [
+        ('roc_auc', "ROC AUC", "mediumpurple"),
+        ('best_f1', "Best F1 Score", "teal"),
+        ('accuracy_at_0.5', "Accuracy (Thr 0.5)", "cornflowerblue")
+    ]
     
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.barh(top_df['feature'], top_df['importance'], color='teal')
-    
-    ax.set_xlabel('Permutation Importance (Increase in Loss)')
-    ax.set_title('Top 20 Most Important Features (Deep SVDD)')
-    ax.grid(axis='x', linestyle='--', alpha=0.5)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(run_dir, "feature_importance.png"))
-    plt.close()
-    print("  Saved feature_importance.png")
+    for col, title, color in metrics:
+        if col in comp_df.columns:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            bars = ax.bar(model_names, comp_df[col], color=color, width=0.4)
+            ax.set_title(f'Comparative {title}')
+            ax.set_ylabel(title)
+            plt.xticks(rotation=0)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            ax.set_ylim(0, 1.1)
+            for bar in bars:
+                yval = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2, yval + 0.005, f"{yval:.4f}", ha='center', va='bottom', fontsize=9)
+            plt.tight_layout()
+            plt.savefig(os.path.join(run_dir, f"comparison_{col}.png"))
+            plt.close(fig)
 
 def main():
-    # Find the latest run automatically
+    print("Starting plotting script for CNN...")
     run_dir = find_latest_run_dir(RUNS_BASE_DIR)
-    if not run_dir:
-        print("No run directory found. Run main.py first.")
-        return
-        
-    print(f"Processing plots for: {run_dir}")
-    
-    # 1. Feature Importance
-    plot_feature_importance(run_dir)
-    
-    # 2. Process Results for each scenario
-    result_files = glob.glob(os.path.join(run_dir, "results_*.npz"))
-    
-    for r_file in result_files:
-        scenario = os.path.basename(r_file).replace("results_", "").replace(".npz", "")
-        
-        data = np.load(r_file)
-        scores = data["scores"]
-        labels = data["labels"]
-        
-        # Only plot if we have scores and at least two classes (0 and 1)
-        if len(scores) > 0 and len(np.unique(labels)) > 1:
-            plot_metrics_vs_threshold(scores, labels, scenario, run_dir)
-            plot_roc_curve(scores, labels, scenario, run_dir)
-        else:
-            print(f"Skipping {scenario}: not enough data or only one class present.")
-            
-    print("\nAll plots generated successfully.")
+    if run_dir is None: return
+    print(f"\nProcessing latest run directory: {run_dir}")
+
+    models_path = os.path.join(run_dir, MODELS_PARENT_DIR)
+    if not os.path.exists(models_path): return
+
+    if os.path.exists(models_path):
+        model_dirs = [d for d in os.listdir(models_path) if os.path.isdir(os.path.join(models_path, d))]
+        for model_name in model_dirs:
+            model_dir = os.path.join(models_path, model_name)
+            if os.path.exists(os.path.join(model_dir, LC_CSV_NAME)):
+                plot_learning_curves(model_name, model_dir)
+                plot_confusion_matrix(model_name, model_dir)
+
+    comp_csv_path = os.path.join(run_dir, COMP_CSV_NAME)
+    if os.path.exists(comp_csv_path):
+        try:
+            comp_df = pd.read_csv(comp_csv_path)
+            plot_model_comparison(comp_df, run_dir)
+        except Exception as e:
+            print(f"Error reading comparison CSV: {e}")
+
+    print("\nPlotting script finished successfully.")
 
 if __name__ == "__main__":
     main()
