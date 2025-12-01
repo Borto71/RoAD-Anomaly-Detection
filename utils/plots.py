@@ -7,7 +7,7 @@ import seaborn as sns
 import numpy as np
 
 # Directory settings
-RUNS_BASE_DIR = "../runs_cnn"
+RUNS_BASE_DIR = "../runs_combined"
 MODELS_PARENT_DIR = "Models"
 LC_CSV_NAME = "learning_curve_test.csv"
 COMP_CSV_NAME = "models_comparison_test.csv"

@@ -1,26 +1,40 @@
 import torch
 import torch.nn as nn
 
-class MLP(nn.Module): # classe MLP che estende nn.Module
+class TabularAnomalyMLP(nn.Module):
     """
-    Simple multilayer perceptron for Fashion-MNIST.
-    Input: 28x28 grayscale images (flattened)
-    Output: 10 classes
+    Autoencoder MLP for the detection of anomalies in tabular data.
     """
-    def __init__(self, in_dim = 28 * 28, num_classes = 10, p_drop = 0.2): # input from 28x28 images in grey scale, for 10 classes, dropout prob 0.2
+    def __init__(self, input_dim, hidden_dim = 64, bottleneck_dim = 32, p_drop = 0.2):
+        """
+        Args:
+            input_dim:      Number of input features.
+            hidden_dim:     Number of neurons in the hidden layers.
+            bottleneck_dim: Number of neurons in the bottleneck layer.
+            p_drop:         Dropout probability.
+        """
         super().__init__()
-        self.net = nn.Sequential( 
-            nn.Flatten(), # we transform the 28x28 image into a flat vector
-            nn.Linear(in_dim, 512), # connect the 784 point at the 512 neurons of the hidden layer
-            nn.ReLU(inplace = True), # ReLu activation function, non-linear
-            nn.Dropout(p_drop), # during training, disable randomly the 20% of the neurons to avoid overfitting
+        
+            # ENCODER
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace = True),
+            nn.Dropout(p_drop),
             
-            nn.Linear(512, 256), # second layer, connect 512 to 256 neurons
-            nn.ReLU(inplace = True), # ReLu activation function
-            nn.Dropout(p_drop), # dropout for regularization
+            nn.Linear(hidden_dim, bottleneck_dim) # Bottleneck layer (no activation)
+        )
+        
+        # DECODER
+        self.decoder = nn.Sequential(
+            nn.Linear(bottleneck_dim, hidden_dim),
+            nn.ReLU(inplace = True),
+            nn.Dropout(p_drop),
             
-            nn.Linear(256, num_classes) # final layer, connect 256 neurons to 10 output classes
+            nn.Linear(hidden_dim, input_dim) 
+            # No final activation (regression task)
         )
 
     def forward(self, x):
-        return self.net(x) # forward pass through the network
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
