@@ -1,6 +1,6 @@
 /data/dataset/
 /models/__pycache__/
 /models/cnn_1d.pyc
-/runs/
 /AutogluonModels/
 /runs_autogluon/
+/runs_cnn/

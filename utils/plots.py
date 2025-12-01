@@ -1,258 +1,166 @@
 import os
-import json
-import argparse
-
-import matplotlib.pyplot as plt
+import glob
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import roc_curve, auc, precision_recall_fscore_support
 
-def get_project_root():
-    script_dir = os.path.dirname(os.path.abspath(__file__)) 
-    project_root = os.path.dirname(script_dir)                
-    return project_root
+# Directory settings
+RUNS_BASE_DIR = "../runs_cnn"
 
-def get_latest_run(runs_root = None):
-    if runs_root is None:
-        project_root = get_project_root()
-        runs_root = os.path.join(project_root, "runs")
-
-    if not os.path.isdir(runs_root):
-        raise FileNotFoundError(f"Runs directory '{runs_root}' not found")
-
-    runs = [
-        d for d in os.listdir(runs_root)
-        if os.path.isdir(os.path.join(runs_root, d)) and d.startswith("run_")
-    ]
-    if not runs:
-        raise FileNotFoundError(f"No run_* directories found inside '{runs_root}'.")
-
-    runs.sort()
-    latest = runs[-1]
-    return os.path.join(runs_root, latest)
-
-
-def load_metrics(run_dir):
+def find_latest_run_dir(base_dir):
     """
-    Load the runs JSON
+    Finds the most recent experiment folder based on the timestamp.
     """
+    run_dirs = glob.glob(os.path.join(base_dir, "run_*"))
+    if not run_dirs: return None
+    run_dirs.sort(reverse=True)
+    return run_dirs[0]
 
-    metrics_path = os.path.join(run_dir, "metrics.json")
-    if not os.path.isfile(metrics_path):
-        raise FileNotFoundError(f"metrics,json not found in '{run_dir}'")
+def plot_metrics_vs_threshold(scores, labels, scenario_name, output_dir):
+    """
+    Plots F1 Score, Accuracy Class 0 (Normal), and Accuracy Class 1 (Anomaly)
+    as a function of the anomaly score threshold.
+    """
+    print(f"  Generating Threshold Curves for {scenario_name}...")
     
-    with open(metrics_path, "r") as f:
-        data = json.load(f)
-
-    return data
-
-def plot_train_loss(data, run_dir):
-    """
-    Plot the curve of the training loss and save it as PNG
-    """
-    losses = data["train"]["loss_per_epoch"]
-    epochs = np.arange(1, len(losses) + 1)
-
-    plt.figure()
-    plt.plot(epochs, losses, marker="o")
-    plt.xlabel("Epoch")
-    plt.ylabel("Train Loss")
-    plt.title("Training Loss per Epoch")
-    plt.grid(True)
-
-    out_path = os.path.join(run_dir, "train_loss.png")
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close()
-    print(f"Saved training loss plot to '{out_path}'")
-
-
-
-def plot_auc_bars(data, run_dir):
-    """
-    Plot a bar chart of the ROC-AUC per scenario
-    """
-    scenarios = ["collision", "weight_vs_control", "velocity_vs_control"]
-    labels = ["Collision", "Weight vs Control" , "Velocity vs Control"]
-
-    aucs = []
-    for s in scenarios:
-        metrics = data.get(s, None)
-        if metrics is None or metrics.get("roc_auc") is None:
-            aucs.append(0.0)
-        else:
-            aucs.append(metrics["roc_auc"])
+    # Generate a range of thresholds between min and max scores
+    t_min, t_max = scores.min(), scores.max()
+    thresholds = np.linspace(t_min, t_max, 200) # 200 steps for a smooth curve
     
-    x = np.arange(len(scenarios))
-
-    plt.figure()
-    plt.bar(x, aucs)
-    plt.xticks(x, labels, rotation = 20)
-    plt.ylim(0.0, 1.0)
-    plt.ylabel("ROC-AUC")
-    plt.title("ROC-AUC per scenario")
-    plt.grid(axis = "y", linestyle = "--", alpha = 0.7)
+    f1_list = []
+    acc0_list = []
+    acc1_list = []
     
-    for i, v in enumerate(aucs):
-        plt.text(i, v + 0.02, f"{v:.2f}", ha="center", va="bottom")
-
-    out_path = os.path.join(run_dir, "roc_auc_bars.png")
-    plt.savefig(out_path, bbox_inches="tight")
+    for thr in thresholds:
+        # Predicted: 1 if score >= threshold, else 0
+        y_pred = (scores >= thr).astype(int)
+        
+        # Calculate Confusion Matrix elements manually
+        tp = ((labels == 1) & (y_pred == 1)).sum()
+        tn = ((labels == 0) & (y_pred == 0)).sum()
+        fp = ((labels == 0) & (y_pred == 1)).sum()
+        fn = ((labels == 1) & (y_pred == 0)).sum()
+        
+        # Specificity (Accuracy on Normals)
+        acc0 = tn / (tn + fp) if (tn + fp) > 0 else 0.0 
+        # Recall / Sensitivity (Accuracy on Anomalies)
+        acc1 = tp / (tp + fn) if (tp + fn) > 0 else 0.0 
+        
+        # F1 Score calculation
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = acc1
+        f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        
+        f1_list.append(f1)
+        acc0_list.append(acc0)
+        acc1_list.append(acc1)
+        
+    # Plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    ax.plot(thresholds, f1_list, label='F1 Score', color='green', linewidth=2)
+    ax.plot(thresholds, acc0_list, label='Accuracy Class 0 (Normal)', color='blue', linestyle='--')
+    ax.plot(thresholds, acc1_list, label='Accuracy Class 1 (Anomaly)', color='orange', linestyle='--')
+    
+    # Highlight the Best F1 Score
+    best_idx = np.argmax(f1_list)
+    best_thr = thresholds[best_idx]
+    best_f1 = f1_list[best_idx]
+    
+    ax.scatter(best_thr, best_f1, color='black', zorder=5)
+    ax.text(best_thr, best_f1 + 0.02, f"Best F1: {best_f1:.2f}\nThr: {best_thr:.2f}", ha='center')
+    
+    ax.set_title(f'Metrics vs Threshold - {scenario_name.capitalize()}')
+    ax.set_xlabel('Anomaly Score Threshold (Distance^2)')
+    ax.set_ylabel('Score')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"curves_threshold_{scenario_name}.png"))
     plt.close()
-    print(f"Saved ROC-AUC bar plot to {out_path}")
 
-
-def plot_f1_bars(data, run_dir):
+def plot_roc_curve(scores, labels, scenario_name, output_dir):
     """
-    Plot a bar chart for the f1 score
+    Plots the standard Receiver Operating Characteristic (ROC) curve.
     """
-    scenarios = ["collision", "weight_vs_control", "velocity_vs_control"]
-    labels = ["Collision", "Weight vs Control", "Velocity vs Control"]
-
-    f1s = []
-    for s in scenarios:
-        metrics = data.get(s, None)
-        if metrics is None or metrics.get("f1") is None:
-            f1s.append(0.0)
-        else:
-            f1s.append(metrics["f1"])
-
-    x = np.arange(len(scenarios))
-
-    plt.figure()
-    plt.bar(x, f1s)
-    plt.xticks(x, labels, rotation=20)
-    plt.ylim(0.0, 1.0)
-    plt.ylabel("F1-score")
-    plt.title("F1-score per scenario (best threshold)")
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-
-    for i, v in enumerate(f1s):
-        plt.text(i, v + 0.02, f"{v:.2f}", ha="center", va="bottom")
-
-    out_path = os.path.join(run_dir, "f1_bars.png")
-    plt.savefig(out_path, bbox_inches="tight")
+    fpr, tpr, _ = roc_curve(labels, scores)
+    roc_auc = auc(fpr, tpr)
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.3f})')
+    ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel('False Positive Rate (1 - Acc Class 0)')
+    ax.set_ylabel('True Positive Rate (Acc Class 1)')
+    ax.set_title(f'ROC Curve - {scenario_name.capitalize()}')
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"roc_curve_{scenario_name}.png"))
     plt.close()
-    print(f"Saved F1 bar plot to {out_path}")
 
+def plot_feature_importance(run_dir):
+    """
+    Reads the CSV generated during training and plots the top 20 features.
+    """
+    csv_path = os.path.join(run_dir, "feature_importance.csv")
+    if not os.path.exists(csv_path):
+        print("Feature importance CSV not found.")
+        return
 
-def plot_class_loss(data, run_dir):
-    scenarios = ["collision", "weight_vs_control", "velocity_vs_control"]
-    scen_labels = ["Collision", "Weight vs Control", "Velocity vs Control"]
-
-    normal_losses = []
-    anom_losses = []
-
-    for s in scenarios:
-        metrics = data.get(s, None)
-        if metrics is None:
-            normal_losses.append(0.0)
-            anom_losses.append(0.0)
-        else:
-            ln = metrics.get("mean_loss_normal", None)
-            la = metrics.get("mean_loss_anom", None)
-            normal_losses.append(ln if ln is not None else 0.0)
-            anom_losses.append(la if la is not None else 0.0)
-
-    x = np.arange(len(scenarios))
-    width = 0.35
-
-    plt.figure()
-    plt.bar(x - width/2, normal_losses, width, label="Normal")
-    plt.bar(x + width/2, anom_losses,   width, label="Anomal")
-
-    plt.xticks(x, scen_labels, rotation=20)
-    plt.ylabel("Mean loss (score)")
-    plt.title("Mean loss per class and scenario")
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.legend()
-
-
-    out_path = os.path.join(run_dir, "class_loss_bars.png")
-    plt.savefig(out_path, bbox_inches="tight")
+    df = pd.read_csv(csv_path)
+    
+    # Select top 20 and sort ascending for the horizontal bar chart
+    top_df = df.head(20).sort_values(by="importance", ascending=True) 
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.barh(top_df['feature'], top_df['importance'], color='teal')
+    
+    ax.set_xlabel('Permutation Importance (Increase in Loss)')
+    ax.set_title('Top 20 Most Important Features (Deep SVDD)')
+    ax.grid(axis='x', linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "feature_importance.png"))
     plt.close()
-    print(f"Saved per-class loss bar plot to {out_path}")
-
-def plot_class_accuracy(data, run_dir):
-    scenarios = ["collision", "weight_vs_control", "velocity_vs_control"]
-    scen_labels = ["Collision", "Weight vs Control", "Velocity vs Control"]
-
-    acc_normals = []
-    acc_anoms = []
-
-    for s in scenarios:
-        metrics = data.get(s, None)
-        if metrics is None:
-            acc_normals.append(0.0)
-            acc_anoms.append(0.0)
-        else:
-            an = metrics.get("acc_normal", None)
-            aa = metrics.get("acc_anom", None)
-            acc_normals.append(an if an is not None else 0.0)
-            acc_anoms.append(aa if aa is not None else 0.0)
-
-    x = np.arange(len(scenarios))
-    width = 0.35
-
-    plt.figure()
-    plt.bar(x - width/2, acc_normals, width, label="Normal")
-    plt.bar(x + width/2, acc_anoms,   width, label="Anomal")
-
-    plt.xticks(x, scen_labels, rotation=20)
-    plt.ylim(0.0, 1.0)
-    plt.ylabel("Accuracy")
-    plt.title("Per-class accuracy per scenario (best threshold)")
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.legend()
-
-    for i, (n, a) in enumerate(zip(acc_normals, acc_anoms)):
-        plt.text(i - width/2, n + 0.02, f"{n:.2f}", ha="center", va="bottom", fontsize=8)
-        plt.text(i + width/2, a + 0.02, f"{a:.2f}", ha="center", va="bottom", fontsize=8)
-
-    out_path = os.path.join(run_dir, "class_accuracy_bars.png")
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close()
-    print(f"Saved per-class accuracy bar plot to {out_path}")
-
+    print("  Saved feature_importance.png")
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot RoAD anomaly detection results.")
-    parser.add_argument(
-        "--run_dir",
-        type=str,
-        default=None,
-        help="Path to a specific run directory (e.g., runs/run_20250207_154355). "
-             "If not provided, the latest run in 'runs/' will be used.",
-    )
-    args = parser.parse_args()
-
-    if args.run_dir is not None:
-        run_dir = args.run_dir
-    else:
-        run_dir = get_latest_run()
-
-    print(f"Using run directory: {run_dir}")
-
-    data = load_metrics(run_dir)
-
-    # Plots
-    plot_train_loss(data, run_dir)
-    plot_auc_bars(data, run_dir)
-    plot_f1_bars(data, run_dir)
-
-    data = load_metrics(run_dir)
-
-    # Plots 
-    plot_train_loss(data, run_dir)
-    plot_auc_bars(data, run_dir)
-    plot_f1_bars(data, run_dir)
-
-    # New Plots per class
-    plot_class_loss(data, run_dir)
-    plot_class_accuracy(data, run_dir)
-
-
+    # Find the latest run automatically
+    run_dir = find_latest_run_dir(RUNS_BASE_DIR)
+    if not run_dir:
+        print("No run directory found. Run main.py first.")
+        return
+        
+    print(f"Processing plots for: {run_dir}")
+    
+    # 1. Feature Importance
+    plot_feature_importance(run_dir)
+    
+    # 2. Process Results for each scenario
+    result_files = glob.glob(os.path.join(run_dir, "results_*.npz"))
+    
+    for r_file in result_files:
+        scenario = os.path.basename(r_file).replace("results_", "").replace(".npz", "")
+        
+        data = np.load(r_file)
+        scores = data["scores"]
+        labels = data["labels"]
+        
+        # Only plot if we have scores and at least two classes (0 and 1)
+        if len(scores) > 0 and len(np.unique(labels)) > 1:
+            plot_metrics_vs_threshold(scores, labels, scenario, run_dir)
+            plot_roc_curve(scores, labels, scenario, run_dir)
+        else:
+            print(f"Skipping {scenario}: not enough data or only one class present.")
+            
+    print("\nAll plots generated successfully.")
 
 if __name__ == "__main__":
     main()
-
-
-
-    

@@ -1,586 +1,332 @@
-from RoADDataset import Dataset as RoADDataset
-from torch.utils.data import Dataset, DataLoader
+import os
+import time
+import json
 import numpy as np
 import torch
-from models.cnn_1d import RoADCNN1D
-from models.cnn_1d import build_model
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
-import time
-import os
-import json
-import torch
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score, average_precision_score
 
+# Custom imports
+from RoADDataset import Dataset as RoADDataset
+from models.cnn_1d import build_model
+
+# ---------------------------------------------------------
+# 1. DATASET WINDOWING
+# ---------------------------------------------------------
 class RoADWindowedDataset(Dataset):
-    def __init__(self, records, window_size, stride, num_features = 86, include_label = False):
+    def __init__(self, records, window_size, stride, num_features=86, include_label=False):
+        """
+        Creates sliding windows from the list of records.
+        """
         self.records = records
         self.window_size = window_size
         self.stride = stride
         self.num_features = num_features
         self.include_label = include_label
-    
-        self.index_map = [] # list of (record_index, start_index) tuples
+        self.index_map = [] 
 
-        for rec_idx, arr in enumerate(records): # arr is ndarray of shape (N, C)
+        # Build an index map to handle multiple recordings of different lengths
+        for rec_idx, arr in enumerate(records):
             N = arr.shape[0]
+            if N < window_size: continue
             for start in range(0, N - window_size + 1, stride):
                 self.index_map.append((rec_idx, start))
 
     def __len__(self): 
         return len(self.index_map)
     
-    def __getitem__(self, idx): # returns a window
+    def __getitem__(self, idx): 
         rec_idx, start = self.index_map[idx]
         arr = self.records[rec_idx]
-
-        window = arr[start:start + self.window_size, :self.num_features]
-        window = window.T
-        x_tensor = torch.from_numpy(window.astype(np.float32))
+        
+        # Extract window and transpose to (Channels, Time) for PyTorch Conv1d
+        window_data = arr[start : start + self.window_size, :self.num_features]
+        x_tensor = torch.from_numpy(window_data.T.astype(np.float32)) 
 
         if not self.include_label:
             return x_tensor
 
-        window_labels = arr[start:start + self.window_size, self.num_features]  # (T,)
-        label_value = 1.0 if window_labels.max() > 0 else 0.0
-        y_tensor = torch.tensor(label_value, dtype = torch.float32)
-        return x_tensor, y_tensor
+        # If labels are present (usually the last column), check if any anomaly exists in the window
+        if arr.shape[1] > self.num_features:
+            window_labels = arr[start : start + self.window_size, self.num_features]
+            label_value = 1.0 if window_labels.max() > 0 else 0.0
+        else:
+            label_value = 0.0
+            
+        return x_tensor, torch.tensor(label_value, dtype=torch.float32)
 
-
-def compute_minmax(train_records, num_features = 86):
-    # transform all in one big array 
-    arrays = [np.asarray(rec)[:, :num_features] for rec in train_records]
-    big = np.concatenate(arrays, axis = 0)
-
-    feat_min = big.min(axis = 0) # feature-wise min
-    feat_max = big.max(axis = 0) # feature-wise max
-
-    return feat_min.astype(np.float32), feat_max.astype(np.float32) # not including label 87 
-
-def minmax_scale(arr, min_vals, max_vals, eps = 1e-8): # scale to [-1, 1]
-    arr = arr.astype(np.float32)
-    num = arr - min_vals
-    den = (max_vals - min_vals) + eps
-    return 2.0 * (num / den) - 1.0 # return scaled array
-
-def normalize_records(records, feat_min, feat_max, num_features = 86):
+# ---------------------------------------------------------
+# 2. UTILS
+# ---------------------------------------------------------
+def compute_minmax_incremental(train_records, num_features=86):
     """
+    Computes global min and max across all training records incrementally
+    to avoid loading everything into memory at once.
+    """
+    print("Computing Min/Max incrementally...")
+    global_min = np.full(num_features, np.inf, dtype=np.float32)
+    global_max = np.full(num_features, -np.inf, dtype=np.float32)
+    
+    for rec in train_records:
+        arr = np.asarray(rec)[:, :num_features]
+        if arr.shape[0] == 0: continue
+        global_min = np.minimum(global_min, arr.min(axis=0))
+        global_max = np.maximum(global_max, arr.max(axis=0))
+        
+    return global_min, global_max
+
+def normalize_records(records, feat_min, feat_max, num_features=86):
+    """
+    Normalizes features to the range [-1, 1].
     """
     norm_recs = []
+    eps = 1e-8
+    den = (feat_max - feat_min) + eps
+    
     for rec in records:
         arr = np.asarray(rec)
-        feats = arr[:, :num_features]                     # (N, 86)
-        feats_scaled = minmax_scale(feats, feat_min, feat_max)  # (N, 86)
-
+        feats = arr[:, :num_features]
+        # Scale to [-1, 1]
+        feats_scaled = 2.0 * ((feats - feat_min) / den) - 1.0
+        
+        # Keep labels untouched if they exist
         if arr.shape[1] > num_features:
-            label = arr[:, num_features:num_features + 1]   # (N, 1)
-            arr_scaled = np.concatenate([feats_scaled, label], axis = 1)
+            arr_scaled = np.concatenate([feats_scaled, arr[:, num_features:]], axis=1)
         else:
             arr_scaled = feats_scaled
-
         norm_recs.append(arr_scaled)
+        
     return norm_recs
 
 def compute_center(train_loader, model, device):
     """
-    Calculate the center c in the space of the embedding, 
-    c is calculate on all the window of the training set
+    Initializes the hypersphere center 'c' for Deep SVDD 
+    by taking the mean of the embeddings from the initial forward pass.
     """
+    print("Computing Deep SVDD center c...")
     model.eval()
+    
+    # Dummy pass to get output shape
+    dummy = torch.zeros(1, 86, 256).to(device)
+    c = torch.zeros(model.forward_features(dummy).shape[1]).to(device)
     n_samples = 0
-    c_sum = None
-
+    
     with torch.no_grad():
-        for batch in train_loader:
-            # batch = x, because in the training we don't have the "anomaly" label
-            x = batch.to(device)  # shape: (B, C, T)
-
-            # embedding in windows 
-            z = model.forward_features(x)  # shape: (B, F)
-
-            # storing the sum
-            if c_sum is None:
-                c_sum = z.sum(dim = 0)
-            else:
-                c_sum += z.sum(dim = 0)
-
+        for x in train_loader:
+            x = x.to(device)
+            z = model.forward_features(x)
+            c += z.sum(dim=0)
             n_samples += z.shape[0]
+            
+    c /= n_samples
+    
+    # Avoid zero values to prevent numerical instability
+    c[(abs(c) < 0.1) & (c < 0)] = -0.1
+    c[(abs(c) < 0.1) & (c > 0)] = 0.1
+    
+    return c.detach()
 
-    # global even
-    c = c_sum / n_samples
-    # we secure a clean tensor
-    c = c.detach().to(device)
-    return c
-
-
-def train_one_epoch(model, train_loader, optimizer, c, device):
+# ---------------------------------------------------------
+# 3. FEATURE IMPORTANCE (PERMUTATION)
+# ---------------------------------------------------------
+def compute_permutation_importance(model, loader, c, device, feature_names=None):
     """
-    Execute one epoch training Deep SVDD, 
-    mimimize the distance of the embedding from the center c.
+    Calculates feature importance by shuffling one channel at a time
+    and measuring the increase in Loss (distance from center).
+    Higher loss increase = more important feature.
     """
+    print("\nComputing Permutation Feature Importance...")
+    model.eval()
+    
+    # 1. Compute Base Loss (using a subset for speed)
+    original_losses = []
+    inputs = []
+    
+    max_batches = 10 
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= max_batches: break
+            if isinstance(batch, list): x = batch[0]
+            else: x = batch
+            x = x.to(device)
+            inputs.append(x)
+            
+            z = model.forward_features(x)
+            loss = ((z - c) ** 2).sum(dim=1)
+            original_losses.append(loss.cpu().numpy())
+            
+    inputs = torch.cat(inputs, dim=0) # (N, C, T)
+    base_loss = np.concatenate(original_losses).mean()
+    
+    print(f"Base Loss: {base_loss:.6f}")
+    
+    importances = []
+    num_features = inputs.shape[1] # C
+    
+    for f_idx in range(num_features):
+        # Permutation: shuffle values of this channel across the batch
+        # This breaks the temporal and statistical structure of THIS specific feature
+        x_perm = inputs.clone()
+        idx = torch.randperm(x_perm.shape[0])
+        x_perm[:, f_idx, :] = x_perm[idx, f_idx, :] 
+        
+        with torch.no_grad():
+            z = model.forward_features(x_perm)
+            loss = ((z - c) ** 2).sum(dim=1).mean().item()
+        
+        # Importance = how much the loss increased
+        imp = loss - base_loss
+        importances.append(imp)
+        
+        if (f_idx+1) % 10 == 0:
+            print(f"Processed feature {f_idx+1}/{num_features}...")
+
+    # Save results to dataframe
+    if feature_names is None or len(feature_names) != num_features:
+        feature_names = [f"feat_{i}" for i in range(num_features)]
+        
+    df_imp = pd.DataFrame({
+        "feature": feature_names,
+        "importance": importances
+    })
+    df_imp = df_imp.sort_values(by="importance", ascending=False)
+    return df_imp
+
+# ---------------------------------------------------------
+# 4. TRAINING & SAVE LOGIC
+# ---------------------------------------------------------
+def train_one_epoch(model, loader, optimizer, c, device):
     model.train()
-    running_loss = 0.0
-    n_batches = 0
-    n_samples = 0
-
-    for x in train_loader:
-        # x: (B, C, T)
+    total_loss = 0.0
+    n = 0
+    for x in loader:
         x = x.to(device)
-
         optimizer.zero_grad()
-
-        # 1) embedding of the window
-        z = model.forward_features(x)  # (B, F)
-
-        # 2) loss = even of the quadratic distance of c
-        # c: (F,)
-        dist_sq = (z - c)**2          # (B, F)
-        loss = dist_sq.sum(dim = 1).mean()  # scalar
-
-        # 3) backprop
+        
+        # Deep SVDD Loss: Minimize distance to center c
+        z = model.forward_features(x)
+        loss = ((z - c)**2).sum(dim=1).mean()
+        
         loss.backward()
         optimizer.step()
+        
+        total_loss += loss.item()
+        n += 1
+    return total_loss / max(1, n)
 
-        # intermediate log
-        batch_size = x.shape[0]
-        running_loss += loss.item()
-        n_batches += 1
-        n_samples += batch_size
-
-    avg_loss = running_loss / max(1, n_batches)
-    return avg_loss, n_batches, n_samples
-
-
-def collect_scores_and_labels(model, loader, c, device):
+def collect_inference_results(model, loader, c, device):
     """
-   Pass all the batch of the loader in the model, elaborate:
-   - anomaly score = quadratic distance from c
-   - label of the window 
-   Return two numpy arrays: scores, labels
+    Runs the model on the entire dataset and returns scores and labels.
     """
     model.eval()
-    all_scores = []
-    all_labels = []
-
+    scores, labels = [], []
     with torch.no_grad():
-        for batch in loader:
-            # here the loader test give (x, y)
-            x, y = batch
+        for x, y in loader:
             x = x.to(device)
-
-            # embedding
-            z = model.forward_features(x)  # (B, F)
-
-            # score = quadratic distance from the center
-            dist_sq = (z - c)**2          # (B, F)
-            scores = dist_sq.sum(dim = 1)   # (B,)
-
-            all_scores.append(scores.cpu().numpy())
-            all_labels.append(y.numpy())
-
-    if len(all_scores) == 0:
-        return None, None
-
-    scores = np.concatenate(all_scores, axis = 0)
-    labels = np.concatenate(all_labels, axis = 0)
-    return scores, labels
-
-def compute_metrics_from_scores(scores, labels):
-    """
-    scores: numpy array (N,)  anomaly score 
-    labels: numpy array (N,)  0 = normal, 1 = anomaly
-    """
-    # ROC-AUC e PR-AUC
-    roc_auc = roc_auc_score(labels, scores)
-    pr_auc = average_precision_score(labels, scores)
-
-    # "loss per class" = even socre per class
-    if np.any(labels == 0):
-        mean_loss_normal = float(scores[labels == 0].mean())
-    else:
-        mean_loss_normal = None
-
-    if np.any(labels == 1):
-        mean_loss_anom = float(scores[labels == 1].mean())
-    else:
-        mean_loss_anom = None
-
-    # threshold that maximize the F1
-    unique_scores = np.unique(scores)
-    best_f1 = -1.0
-    best_prec = 0.0
-    best_rec = 0.0
-    best_thr = None
-    best_conf = None  # TP, FP, TN, FN at better threshold
-
-    for thr in unique_scores:
-        y_pred = (scores >= thr).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(
-            labels, y_pred, average="binary", zero_division = 0
-        )
-        if f1 > best_f1:
-            best_f1 = f1
-            best_prec = prec
-            best_rec = rec
-            best_thr = thr
-
-            # confusion matrix per accuracy per class
-            tp = int(((labels == 1) & (y_pred == 1)).sum())
-            tn = int(((labels == 0) & (y_pred == 0)).sum())
-            fp = int(((labels == 0) & (y_pred == 1)).sum())
-            fn = int(((labels == 1) & (y_pred == 0)).sum())
-            best_conf = (tp, fp, tn, fn)
-
-    if best_conf is not None:
-        tp, fp, tn, fn = best_conf
-        total = tp + fp + tn + fn
-
-        acc_overall = (tp + tn) / total if total > 0 else None
-        # accuracy class normal = TN / (TN + FP)
-        den_normal = tn + fp
-        acc_normal = tn / den_normal if den_normal > 0 else None
-        # accuracy class anomaly = TP / (TP + FN) = recall
-        den_anom = tp + fn
-        acc_anom = tp / den_anom if den_anom > 0 else None
-    else:
-        acc_overall = None
-        acc_normal = None
-        acc_anom = None
-
-    metrics = {
-        "roc_auc": float(roc_auc),
-        "pr_auc": float(pr_auc),
-        "mean_loss_normal": mean_loss_normal,
-        "mean_loss_anom": mean_loss_anom,
-        "best_threshold": float(best_thr) if best_thr is not None else None,
-        "precision": float(best_prec),
-        "recall": float(best_rec),
-        "f1": float(best_f1),
-        "acc_overall": acc_overall,
-        "acc_normal": acc_normal,
-        "acc_anom": acc_anom,
-    }
-    return metrics
-
-
+            z = model.forward_features(x)
+            # Anomaly score is the squared distance from center
+            dist = ((z - c)**2).sum(dim=1)
+            scores.append(dist.cpu().numpy())
+            labels.append(y.numpy())
+            
+    if len(scores) == 0: return np.array([]), np.array([])
+    return np.concatenate(scores), np.concatenate(labels)
 
 def main():
-    # Create unique run directory
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join("runs", f"run_{timestamp}")
-    os.makedirs(run_dir, exist_ok = True)
+    run_dir = os.path.join("runs_cnn", f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
     print(f"\nSaving outputs to: {run_dir}")
 
-    ds = RoADDataset(normalize = False)
+    # Configuration
+    WINDOW_SIZE = 256
+    STRIDE = 128
+    NUM_FEAT = 86
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load Dataset
+    ds = RoADDataset(normalize=False)
+    
+    # Get feature names if available in the dataset object
+    feat_names = ds.feature_names if hasattr(ds, 'feature_names') else None
 
-    print("Subsets available:", ds.sets.keys()) # show the available subset for training and validation
+    # Load & Normalize Data
+    train_recs = list(ds.sets["training"]) + list(ds.sets.get("control", []))
+    coll_recs = list(ds.sets.get("collision", []))
+    weight_recs = list(ds.sets.get("weight", []))
+    vel_recs = list(ds.sets.get("velocity", []))
+    
+    # Compute scaling parameters on training data only
+    fmin, fmax = compute_minmax_incremental(train_recs, NUM_FEAT)
+    
+    # Apply normalization
+    train_norm = normalize_records(train_recs, fmin, fmax)
+    coll_norm = normalize_records(coll_recs, fmin, fmax)
+    weight_norm = normalize_records(weight_recs, fmin, fmax)
+    vel_norm = normalize_records(vel_recs, fmin, fmax)
+    ctrl_norm = normalize_records(ds.sets.get("control", []), fmin, fmax)
 
-    # 1) Train subset, used only for training
-    base_train_records = ds.sets["training"]
-    control_records = ds.sets.get("control", [])
+    # Data Loaders
+    train_loader = DataLoader(RoADWindowedDataset(train_norm, WINDOW_SIZE, STRIDE), batch_size=128, shuffle=True)
+    
+    # Build Model
+    model = build_model(in_channels=NUM_FEAT).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
+    # Initialize Center
+    c = compute_center(train_loader, model, DEVICE)
+    
+    # Training Loop
+    best_loss = np.inf
+    for ep in range(1, 21): # Train for 20 epochs
+        loss = train_one_epoch(model, train_loader, optimizer, c, DEVICE)
+        print(f"Epoch {ep:02d} | Loss: {loss:.6f}")
+        
+        # Save best model checkpoint
+        if loss < best_loss:
+            best_loss = loss
+            ckpt = {"model": model.state_dict(), "c": c, "min": fmin, "max": fmax}
+            torch.save(ckpt, os.path.join(run_dir, "model_best.pt"))
 
-    # Combined training = training + control
-    train_records = list(base_train_records) + list(control_records)
+    # --- POST TRAINING EVALUATION ---
+    print("\nLoading best model for evaluation...")
+    ckpt = torch.load(os.path.join(run_dir, "model_best.pt"), weights_only = False) 
+    model.load_state_dict(ckpt["model"])
+    c = ckpt["c"]
 
-    # 2) Test set, subset of collision, weight, velocity and control
-    collision_records = ds.sets.get("collision", [])
-    weight_records    = ds.sets.get("weight",    [])
-    velocity_records  = ds.sets.get("velocity",  [])
+    # 1. Feature Importance
+    # We use the training set to understand what the model considers "normal" features
+    df_imp = compute_permutation_importance(model, train_loader, c, DEVICE, feature_names=feat_names)
+    df_imp.to_csv(os.path.join(run_dir, "feature_importance.csv"), index=False)
+    print(f"Feature importance saved.")
 
-    print(f"Number of training records:  {len(train_records)}")
-    print(f"Number of collision records: {len(collision_records)}")
-    print(f"Number of weight records:    {len(weight_records)}")
-    print(f"Number of velocity records:  {len(velocity_records)}")
-    print(f"Number of control records:   {len(control_records)}")
-
-    first = train_records[0]
-    arr = np.asarray(first)
-    print("Shape of first training record:", arr.shape) # (N, C)
-    print("Feature number", arr.shape[1])
-
-    # 1) Compute global min/max from TRAIN ONLY
-    print("Computing global min/max over the training set...")
-    feat_min, feat_max = compute_minmax(train_records, num_features = 86)
-
-    # 2) Normalize all subsets using train stats
-    train_norm    = normalize_records(train_records,    feat_min, feat_max, num_features = 86)
-    collision_norm = normalize_records(collision_records, feat_min, feat_max, num_features = 86)
-    weight_norm    = normalize_records(weight_records,    feat_min, feat_max, num_features = 86)
-    velocity_norm  = normalize_records(velocity_records,  feat_min, feat_max, num_features = 86)
-    control_norm   = normalize_records(control_records,   feat_min, feat_max, num_features = 86)
-
-    # 3) Show some stats
-    print("Global feature-wise min (first 5 features):", feat_min[:5])
-    print("Global feature-wise max (first 5 features):", feat_max[:5])
-
-        # 4) Create windowed datasets
-
-    # TRAIN: unsupervised, no label
-    train_dataset = RoADWindowedDataset(
-        train_norm,
-        window_size = 256,
-        stride = 128,
-        num_features = 86,
-        include_label = False,
-    )
-
-    # TEST SCENARIOS: here we have the label
-    collision_dataset = RoADWindowedDataset(
-        collision_norm,
-        window_size = 256,
-        stride = 128,
-        num_features = 86,
-        include_label = True,
-    )
-
-    weight_dataset = RoADWindowedDataset(
-        weight_norm,
-        window_size = 256,
-        stride = 128,
-        num_features = 86,
-        include_label = True,
-    )
-
-    velocity_dataset = RoADWindowedDataset(
-        velocity_norm,
-        window_size = 256,
-        stride = 128,
-        num_features = 86,
-        include_label = True,
-    )
-
-    control_dataset = RoADWindowedDataset(
-        control_norm,
-        window_size = 256,
-        stride = 128,
-        num_features = 86,
-        include_label = True,
-    )
-
-    print("Total train windows:", len(train_dataset))
-    print("Total collision windows:", len(collision_dataset))
-    print("Total weight windows:", len(weight_dataset))
-    print("Total velocity windows:", len(velocity_dataset))
-    print("Total control windows:", len(control_dataset))
-
-    # Check on a sample
-    x_train = train_dataset[0]
-    print("Sample train window shape:", x_train.shape)  # (C, T)
-
-    if len(collision_dataset) > 0:
-        x_col, y_col = collision_dataset[0]
-        print("Sample collision window shape:", x_col.shape)
-        print("Sample collision window label:", y_col.item())
-
-    # DataLoader Hyperparameters
-    batch_size_train = 128
-    batch_size_eval = 256
-    num_workers = 0
-    pin_memory = torch.cuda.is_available()
-
-    # Train Dataloaders
-    train_loader = DataLoader(train_dataset, batch_size = batch_size_train, shuffle = True, drop_last = False, num_workers = num_workers, pin_memory = pin_memory)
-
-    # Test DataLoaders
-    collision_loader = DataLoader(
-        collision_dataset,
-        batch_size = batch_size_eval,
-        shuffle = False,
-        drop_last = False,
-        num_workers = num_workers,
-        pin_memory = pin_memory,
-    )
-
-    weight_loader = DataLoader(
-        weight_dataset,
-        batch_size = batch_size_eval,
-        shuffle = False,
-        drop_last = False,
-        num_workers = num_workers,
-        pin_memory = pin_memory,
-    )
-
-    velocity_loader = DataLoader(
-        velocity_dataset,
-        batch_size = batch_size_eval,
-        shuffle = False,
-        drop_last = False,
-        num_workers = num_workers,
-        pin_memory = pin_memory,
-    )
-
-    control_loader = DataLoader(
-        control_dataset,
-        batch_size = batch_size_eval,
-        shuffle = False,
-        drop_last = False,
-        num_workers = num_workers,
-        pin_memory = pin_memory,
-    )
-
-    # Dictionary for dataloaders
-    test_loaders = { 
-        "collision": collision_loader,
-        "weight": weight_loader,
-        "velocity": velocity_loader,
-        "control": control_loader,
+    # 2. Inference on Test Sets
+    # Define scenarios: (Anomaly Records, Normal Records)
+    test_scenarios = {
+        "collision": (coll_norm, ctrl_norm), 
+        "weight": (weight_norm, ctrl_norm),
+        "velocity": (vel_norm, ctrl_norm)
     }
 
-    # Device & Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    for name, (anom_recs, norm_recs) in test_scenarios.items():
+        if len(anom_recs) == 0: continue
+        
+        # Merge anomalies and normal controls for testing
+        full_recs = anom_recs + norm_recs
+        
+        # Create dataset and loader (using include_label=True for evaluation)
+        ds_test = RoADWindowedDataset(full_recs, WINDOW_SIZE, 256, include_label=True)
+        dl_test = DataLoader(ds_test, batch_size=256, shuffle=False)
+        
+        s, y = collect_inference_results(model, dl_test, c, DEVICE)
+        
+        # Save raw scores and labels for plotting later
+        res_path = os.path.join(run_dir, f"results_{name}.npz")
+        np.savez(res_path, scores=s, labels=y)
+        print(f"Saved results for {name} to {res_path}")
 
-    # building the model
-    model = build_model(in_channels = 86, base_channels = 64, dropout = 0.1, return_frame_logits = False).to(device)
-
-    # Optimizer for Deep SVDD
-    optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4, weight_decay = 1e-6)
-
-    # Cumpute center c in feature space
-    print("Computing center c from training data embeddings...")
-    c = compute_center(train_loader, model, device)
-    print("Center c shape", c.shape)
-
-    # Training Loop Deep SVDD
-    num_epochs = 50
-    train_losses = []
-    for epoch in range(1, num_epochs + 1):
-        avg_loss, n_batches, n_samples = train_one_epoch(model, train_loader, optimizer, c, device)
-        print(
-            f"Epoch {epoch:03d}/{num_epochs} "
-            f"- loss: {avg_loss:.6f} "
-            f"- batches: {n_batches} "
-            f"- samples: {n_samples}"
-        )
-
-        train_losses.append(avg_loss)
-
-    # Evaluation scenario: COLLISION
-    print("\nEvaluation scenario: COLLISION")
-
-    coll_scores, coll_labels = collect_scores_and_labels(
-        model, collision_loader, c, device
-    )
-
-    if coll_scores is not None:
-        print("Num normal windows:", int((coll_labels == 0).sum()))
-        print("Num anomal windows:", int((coll_labels == 1).sum()))
-
-        # full metrics
-        coll_metrics = compute_metrics_from_scores(coll_scores, coll_labels)
-
-        print(f"Collision - ROC-AUC: {coll_metrics['roc_auc']:.4f}")
-        print(f"Collision - PR-AUC : {coll_metrics['pr_auc']:.4f}")
-        print(f"Collision - mean loss (normal): {coll_metrics['mean_loss_normal']}")
-        print(f"Collision - mean loss (anom)  : {coll_metrics['mean_loss_anom']}")
-        print(
-            f"Collision - best thr: {coll_metrics['best_threshold']:.4e} "
-            f"| P: {coll_metrics['precision']:.4f} "
-            f"R: {coll_metrics['recall']:.4f} "
-            f"F1: {coll_metrics['f1']:.4f}"
-        )
-    else:
-        coll_metrics = None
-        print("No collision data available for evaluation.")
-
-
-    print("\nEvaluating scenario: WEIGHT vs CONTROL")
-
-    weight_scores, _ = collect_scores_and_labels(model, weight_loader, c, device)
-    control_scores, _ = collect_scores_and_labels(model, control_loader, c, device)
-
-    if weight_scores is not None and control_scores is not None:
-        # definiamo noi le label binarie: weight=1 (anomalo), control=0 (normale)
-        y_weight  = np.ones_like(weight_scores)
-        y_control = np.zeros_like(control_scores)
-
-        scores_wc = np.concatenate([weight_scores, control_scores], axis=0)
-        labels_wc = np.concatenate([y_weight,     y_control],      axis=0)
-
-        weight_metrics = compute_metrics_from_scores(scores_wc, labels_wc)
-
-        print(f"Weight vs Control - ROC-AUC: {weight_metrics['roc_auc']:.4f}")
-        print(f"Weight vs Control - PR-AUC : {weight_metrics['pr_auc']:.4f}")
-        print(f"Weight vs Control - mean loss (normal): {weight_metrics['mean_loss_normal']}")
-        print(f"Weight vs Control - mean loss (anom)  : {weight_metrics['mean_loss_anom']}")
-        print(
-            f"Weight vs Control - best thr: {weight_metrics['best_threshold']:.4e} "
-            f"| P: {weight_metrics['precision']:.4f} "
-            f"R: {weight_metrics['recall']:.4f} "
-            f"F1: {weight_metrics['f1']:.4f}"
-        )
-    else:
-        weight_metrics = None
-        print("Not enough data for WEIGHT vs CONTROL evaluation.")
-
-    # Evaluation scenario: VELOCITY vs CONTROL
-    print("\nEvaluating scenario: VELOCITY vs CONTROL")
-
-    velocity_scores, _ = collect_scores_and_labels(model, velocity_loader, c, device)
-    # control_scores alredy calculated
-
-    if velocity_scores is not None and control_scores is not None:
-        y_velocity = np.ones_like(velocity_scores)
-        y_control  = np.zeros_like(control_scores)
-
-        scores_vc = np.concatenate([velocity_scores, control_scores], axis=0)
-        labels_vc = np.concatenate([y_velocity,     y_control],      axis=0)
-
-        velocity_metrics = compute_metrics_from_scores(scores_vc, labels_vc)
-
-        print(f"Velocity vs Control - ROC-AUC: {velocity_metrics['roc_auc']:.4f}")
-        print(f"Velocity vs Control - PR-AUC : {velocity_metrics['pr_auc']:.4f}")
-        print(f"Velocity vs Control - mean loss (normal): {velocity_metrics['mean_loss_normal']}")
-        print(f"Velocity vs Control - mean loss (anom)  : {velocity_metrics['mean_loss_anom']}")
-        print(
-            f"Velocity vs Control - best thr: {velocity_metrics['best_threshold']:.4e} "
-            f"| P: {velocity_metrics['precision']:.4f} "
-            f"R: {velocity_metrics['recall']:.4f} "
-            f"F1: {velocity_metrics['f1']:.4f}"
-        )
-    else:
-        velocity_metrics = None
-        print("Not enough data for VELOCITY vs CONTROL evaluation.")
-
-    # Bild result dictionary
-
-    results = {
-        "config": {
-            "window_size": 256,
-            "stride": 128,
-            "num_epochs": num_epochs,
-            "batch_size_train": batch_size_train,
-            "batch_size_eval": batch_size_eval,
-        },
-        "train": {
-            "loss_per_epoch": train_losses,
-            "num_train_windows": len(train_dataset),
-        },
-        "collision": coll_metrics,
-        "weight_vs_control": weight_metrics,
-        "velocity_vs_control": velocity_metrics,
-    }
-
-
-    # Save metrics JSON
-    metrics_path = os.path.join(run_dir, "metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(results, f, indent = 2)
-
-    print(f"Saved metrics to {metrics_path}")
-
-    # Save model checkpoint
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "center_c": c.detach().cpu().numpy(),
-        "feat_min": feat_min,
-        "feat_max": feat_max,
-        "config": results["config"],
-    }
-
-    ckpt_path = os.path.join(run_dir, "model.pt")
-    torch.save(ckpt, ckpt_path)
-
-    print(f"Saved model checkpoint to {ckpt_path}")
-
+    print("\nDone. Run plots.py to visualize curves.")
 
 if __name__ == "__main__":
     main()

@@ -281,7 +281,6 @@ class RoADCNN1D(nn.Module):
         # Frame-level logits: per-timestep anomaly score.
         frame_logits = self.frame_head(x)     # (B, 1, T)
 
-        # ----- Sequence-level pooling from frame_logits -----
         # Pool over the temporal dimension to obtain a single score per window.
         if self.seq_pooling == "avg":
             # Simple average over time.
