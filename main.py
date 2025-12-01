@@ -147,19 +147,11 @@ def compute_permutation_importance(model, X_test, y_test, baseline_score, featur
     model.eval()
     importances = []
     
-    # We use BCE Loss as the metric (higher increase = more important) or AUC drop
-    # Let's use AUC drop since it's robust.
-    
-    # X_test shape: (N_samples, Window_Size, Num_Features)
-    # We need to shuffle across the N_samples dimension for a specific feature index.
-    
     n_features = X_test.shape[2] 
     
     # Ensure X_test is a copy so we don't mess up original data
     X_test_np = np.array(X_test, copy=True)
     
-    # Pre-compute y_test tensor once if possible, but we use dataloader usually.
-    # To be safe and consistent with main loop, let's just make a quick helper to get score
     def get_score(X_in):
         ds = SequenceDataset(X_in, y_test)
         dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
@@ -172,30 +164,19 @@ def compute_permutation_importance(model, X_test, y_test, baseline_score, featur
         return roc_auc_score(y_test, all_scores)
 
     for i in range(n_features):
-        # 1. Save original column
         original_col = X_test_np[:, :, i].copy()
+        np.random.shuffle(X_test_np[:, :, i]) # Shuffle across samples
         
-        # 2. Shuffle column across samples
-        # We shuffle the 'samples' axis. The window structure for that feature stays intact per sample? 
-        # Actually, standard permutation importance shuffles the feature across the dataset.
-        # Since this is time-series windowed, if we shuffle 'feature i' across windows, 
-        # we break the correlation of feature i with the label for that window.
-        np.random.shuffle(X_test_np[:, :, i]) 
-        
-        # 3. Predict & Score
         perm_score = get_score(X_test_np)
-        
-        # 4. Importance = Baseline - Permuted (Positive means feature was good)
-        imp = baseline_score - perm_score
+        imp = baseline_score - perm_score # Drop in AUC = Importance
         importances.append(imp)
         
-        # 5. Restore
-        X_test_np[:, :, i] = original_col
+        X_test_np[:, :, i] = original_col # Restore
         
         if (i+1) % 10 == 0:
             print(f"Processed {i+1}/{n_features} features...")
 
-    # Create DataFrame
+    # Assign correct names
     if feature_names and len(feature_names) == n_features:
         names = feature_names
     else:
@@ -207,17 +188,13 @@ def compute_permutation_importance(model, X_test, y_test, baseline_score, featur
     })
     fi_df = fi_df.sort_values(by="importance", ascending=False).reset_index(drop=True)
     
-    # Normalize for easier plotting (0-1 range or relative)
-    # fi_df['importance'] = fi_df['importance'] / fi_df['importance'].sum()
-    
     return fi_df
 
 # --- PyTorch Dataset & Model ---
 
 class SequenceDataset(Dataset):
     def __init__(self, X, y):
-        # Permute X to (N, Features, Time) for PyTorch Conv1D
-        self.X = torch.FloatTensor(X).permute(0, 2, 1) 
+        self.X = torch.FloatTensor(X).permute(0, 2, 1) # (N, Features, Time)
         self.y = torch.FloatTensor(y)
         
     def __len__(self):
@@ -267,12 +244,30 @@ def main():
 
     ds = RoADDataset(normalize=False)
     
-    # Use Dataset feature names if available, else manual list
+    # --- Feature Names Logic (Updated) ---
     if hasattr(ds, 'feature_names') and len(ds.feature_names) == 86:
         feature_names = ds.feature_names
+        print("Using feature names from Dataset class.")
     else:
-        # Fallback list (same as autogluon.py)
-        feature_names = [f"feat_{i}" for i in range(86)] 
+        print("Using manual list of feature names.")
+        feature_names = [
+            "robot_action_id", "apparent_power", "current", "frequency", "phase_angle",
+            "power", "power_factor", "reactive_power", "voltage", 
+            "j1_acc_x", "j1_acc_y", "j1_acc_z", "j1_gyro_x", "j1_gyro_y", "j1_gyro_z",
+            "j1_qw", "j1_qx", "j1_qy", "j1_qz", "j1_temp",
+            "j2_acc_x", "j2_acc_y", "j2_acc_z", "j2_gyro_x", "j2_gyro_y", "j2_gyro_z",
+            "j2_qw", "j2_qx", "j2_qy", "j2_qz", "j2_temp",
+            "j3_acc_x", "j3_acc_y", "j3_acc_z", "j3_gyro_x", "j3_gyro_y", "j3_gyro_z",
+            "j3_qw", "j3_qx", "j3_qy", "j3_qz", "j3_temp",
+            "j4_acc_x", "j4_acc_y", "j4_acc_z", "j4_gyro_x", "j4_gyro_y", "j4_gyro_z",
+            "j4_qw", "j4_qx", "j4_qy", "j4_qz", "j4_temp",
+            "j5_acc_x", "j5_acc_y", "j5_acc_z", "j5_gyro_x", "j5_gyro_y", "j5_gyro_z",
+            "j5_qw", "j5_qx", "j5_qy", "j5_qz", "j5_temp",
+            "j6_acc_x", "j6_acc_y", "j6_acc_z", "j6_gyro_x", "j6_gyro_y", "j6_gyro_z",
+            "j6_qw", "j6_qx", "j6_qy", "j6_qz", "j6_temp",
+            "j7_acc_x", "j7_acc_y", "j7_acc_z", "j7_gyro_x", "j7_gyro_y", "j7_gyro_z",
+            "j7_qw", "j7_qx", "j7_qy", "j7_qz", "j7_temp"
+        ]
 
     base_train = list(ds.sets["training"])
     control = list(ds.sets.get("control", []))
@@ -327,7 +322,7 @@ def main():
         X_test = np.concatenate(X_test_list)
         y_test = np.concatenate(y_test_list)
     else:
-        print("Warning: No test data! Using Train as Test (Debugging only).")
+        print("Warning: No test data! Metrics will be only on Train.")
         X_test = X_train; y_test = y_train
     
     print(f"Train Shape: {X_train.shape}, Test Shape: {X_test.shape}")
@@ -358,7 +353,6 @@ def main():
     print("\nEvaluating...")
     model.eval()
     
-    # Get predictions
     train_scores, train_true = [], []
     with torch.no_grad():
         for inputs, labels in train_loader:
@@ -376,11 +370,8 @@ def main():
     metrics_train, _ = compute_metrics_and_curves(train_true, train_scores)
     metrics_test, lc_test = compute_metrics_and_curves(test_true, test_scores, np.linspace(0.01, 0.99, 99))
     
-    # --- CALCULATE FEATURE IMPORTANCE ---
-    # We use the test AUC as the baseline
+    # --- CALCULATE FEATURE IMPORTANCE (With Correct Names) ---
     baseline_auc = metrics_test["auc_roc"]
-    
-    # For speed, if test set is huge, sample it. Here we use full X_test.
     fi_df = compute_permutation_importance(
         model, X_test, y_test, 
         baseline_score=baseline_auc, 
@@ -389,9 +380,8 @@ def main():
         batch_size=BATCH_SIZE
     )
     
-    # Save Outputs
     fi_path = os.path.join(model_save_dir, "feature_importance.csv")
-    fi_df.to_csv(fi_path, index=True) # index is important if it holds names or just order
+    fi_df.to_csv(fi_path, index=False)
     print(f"Saved feature importance to {fi_path}")
 
     full_metrics = {"train": metrics_train, "test": metrics_test}
