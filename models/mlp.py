@@ -20,7 +20,7 @@ class WindowedMLP(nn.Module):
         in_channels: int, 
         window_size: int, 
         hidden_dim: int = 128, 
-        bottleneck_dim: int = 32, 
+        bottleneck_dim: int = 2, 
         dropout: float = 0.2
     ) -> None:
         """
@@ -113,7 +113,7 @@ def build_mlp_model(
     in_channels: int, 
     window_size: int, 
     hidden_dim: int = 128, 
-    bottleneck_dim: int = 32,
+    bottleneck_dim: int = 2,
     dropout: float = 0.2
 ) -> WindowedMLP:
     """
