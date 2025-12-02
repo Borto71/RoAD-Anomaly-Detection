@@ -395,7 +395,7 @@ def main():
         
     # 7. Save Comparative Results
     comp_df = pd.DataFrame(comparison_rows)
-    comp_df.to_csv(os.path.join(run_dir, "models_comparison_test.csv"), index=False)
+    comp_df.to_csv(os.path.join(run_dir, "models_comparison_test.csv"), index = False)
     print("Done.")
 
 if __name__ == "__main__":
