@@ -309,9 +309,6 @@ def main():
     from RoADDataset import Dataset as RoADDataset
     ds = RoADDataset(normalize=False)
     
-    # Define features (Manual list as backup, same as original script)
-    # [Insert valid features check here if needed, omitted for brevity]
-    
     # Split Records
     base_train = list(ds.sets["training"])
     control_recs = list(ds.sets.get("control", []))
