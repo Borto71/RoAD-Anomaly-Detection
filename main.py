@@ -11,8 +11,9 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
 
+# --- MODIFICA QUI: Assicurati che nel file models/mlp.py la classe si chiami MLP ---
 from models.cnn_1d import build_model as build_cnn
-from models.mlp import WindowedMLP
+from models.mlp import MLP 
 
 # CONFIGURATION
 RUNS_DIR = "runs_pytorch"
@@ -62,8 +63,6 @@ def normalize_records(records, feat_min, feat_max, num_features=86):
 class TimeSeriesWindowDataset(Dataset):
     """
     PyTorch Dataset that creates windows from continuous records.
-    Unlike the AutoGluon script which computed stats (mean/std), 
-    this returns raw tensors (C, T) for Deep Learning models.
     """
     def __init__(self, records, window_size, stride, num_features=86, max_windows=None):
         self.samples = []
@@ -117,12 +116,12 @@ class TimeSeriesWindowDataset(Dataset):
 
 def compute_metrics(y_true, scores, thresholds=None):
     """
-    Computes AUC, PR-AUC, Best F1, and optionally returns a learning curve DataFrame.
+    Computes AUC, PR-AUC, Best F1.
     """
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
     
-    # BCE Loss estimation for metrics
+    # Calculate Log Loss (BCE equivalent)
     eps = 1e-7
     p = np.clip(scores, eps, 1 - eps)
     bce = -(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
@@ -131,9 +130,8 @@ def compute_metrics(y_true, scores, thresholds=None):
     auc_roc = roc_auc_score(y_true, scores)
     pr_auc = average_precision_score(y_true, scores)
     
-    # Find Best F1
+    # Find Best F1 based on thresholding probability of class 1
     unique_scores = np.unique(scores)
-    # Downsample thresholds if too many for speed
     curr_thrs = unique_scores if len(unique_scores) < 1000 else np.quantile(unique_scores, np.linspace(0,1,1000))
     
     best_f1 = -1.0
@@ -146,7 +144,7 @@ def compute_metrics(y_true, scores, thresholds=None):
             best_f1 = f1
             best_thr = thr
             
-    # Metrics at 0.5
+    # Metrics at standard threshold 0.5
     y_pred_05 = (scores >= 0.5).astype(int)
     _, _, f1_05, _ = precision_recall_fscore_support(y_true, y_pred_05, average="binary", zero_division=0)
     acc_05 = float((y_pred_05 == y_true).mean())
@@ -195,36 +193,22 @@ def compute_metrics(y_true, scores, thresholds=None):
 
 # MODEL WRAPPERS 
 
-class ClassificationMLP(nn.Module):
-    """
-    Wraps the provided WindowedMLP (Autoencoder) to act as a Classifier.
-    It uses the 'forward_features' method (Encoder) and adds a classification head.
-    """
-    def __init__(self, in_channels, window_size, hidden_dim=128, bottleneck_dim=32, dropout=0.2):
-        super().__init__()
-        # Initialize the base autoencoder
-        self.backbone = WindowedMLP(in_channels, window_size, hidden_dim, bottleneck_dim, dropout)
-        # Classification head (from latent space z to 1 logit)
-        self.head = nn.Linear(bottleneck_dim, 1)
-        
-    def forward(self, x):
-        # Extract features (z) using the encoder part of the MLP
-        z = self.backbone.forward_features(x) 
-        # Project to logit
-        return self.head(z)
+# --- Ho rimosso ClassificationMLP perché il nuovo MLP è già pronto all'uso ---
 
 class ClassificationCNN(nn.Module):
     """
-    Wraps the RoADCNN1D. The original model returns (seq_logit, frame_logits).
-    We only need seq_logit for this binary classification task.
+    Wraps the RoADCNN1D.
     """
     def __init__(self, in_channels=86, base_channels=64, dropout=0.1):
         super().__init__()
         self.model = build_cnn(in_channels=in_channels, base_channels=base_channels, dropout=dropout)
+        # Projection layer to ensure we have 2 outputs
+        self.adapter = nn.Linear(1, 2) 
         
     def forward(self, x):
-        seq_logit, _ = self.model(x)
-        return seq_logit
+        seq_logit, _ = self.model(x) # seq_logit is likely shape (Batch, 1)
+        # Map (Batch, 1) -> (Batch, 2)
+        return self.adapter(seq_logit)
 
 # TRAINING ENGINE
 
@@ -232,9 +216,9 @@ def train_model(model, train_loader, test_loader, model_name, output_dir):
     print(f"\n--- Training {model_name} ---")
     model = model.to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.BCEWithLogitsLoss()
     
-    best_val_loss = float('inf')
+    # Use CrossEntropyLoss for 2-class output (expects class indices)
+    criterion = nn.CrossEntropyLoss()
     
     # Directories
     model_dir = os.path.join(output_dir, model_name)
@@ -245,10 +229,15 @@ def train_model(model, train_loader, test_loader, model_name, output_dir):
         running_loss = 0.0
         
         for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE).unsqueeze(1)
+            X_batch = X_batch.to(DEVICE)
+            # Targets must be Long (integers) for CrossEntropy
+            y_batch = y_batch.to(DEVICE).long()
             
             optimizer.zero_grad()
+            
+            # Logits shape (Batch, 2)
             logits = model(X_batch)
+            
             loss = criterion(logits, y_batch)
             loss.backward()
             optimizer.step()
@@ -260,16 +249,23 @@ def train_model(model, train_loader, test_loader, model_name, output_dir):
         
     # Final Evaluation on Test Set
     model.eval()
-    all_scores = []
+    all_scores = [] # Probabilities of Class 1
     all_labels = []
     
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             X_batch = X_batch.to(DEVICE)
-            logits = model(X_batch)
-            probs = torch.sigmoid(logits).cpu().numpy().flatten()
             
-            all_scores.extend(probs)
+            # Shape: (Batch, 2)
+            logits = model(X_batch)
+            
+            # 1. Apply Softmax to get probabilities for both classes
+            probs = torch.softmax(logits, dim=1)
+            
+            # 2. Extract probability of Class 1 (index 1) for metrics
+            prob_class_1 = probs[:, 1].cpu().numpy().flatten()
+            
+            all_scores.extend(prob_class_1)
             all_labels.extend(y_batch.numpy())
             
     # Calculate Metrics
@@ -280,17 +276,12 @@ def train_model(model, train_loader, test_loader, model_name, output_dir):
     print(f"  -> Best F1:      {metrics['best_f1']:.4f}")
     
     # Save outputs
-    # 1. Metrics JSON
     with open(os.path.join(model_dir, "metrics_train_test.json"), "w") as f:
-        # Note: We simulate the 'train' key to match plotting script structure, 
-        # though we only calculated detailed metrics for test here.
         json.dump({"test": metrics}, f, indent=2)
         
-    # 2. Learning Curve CSV
     if lc_df is not None:
         lc_df.to_csv(os.path.join(model_dir, "learning_curve_test.csv"), index=False)
         
-    # 3. Save Model
     torch.save(model.state_dict(), os.path.join(model_dir, "model.pth"))
     
     return metrics
@@ -349,7 +340,6 @@ def main():
             recs_tr, recs_te = records, []
             
         # Build Datasets
-        # Note: We merge lists here, will create TensorDataset later
         ds_tr = TimeSeriesWindowDataset(recs_tr, WINDOW_SIZE, TRAIN_STRIDE, NUM_FEATURES, max_windows=4000)
         ds_te = TimeSeriesWindowDataset(recs_te, WINDOW_SIZE, TEST_STRIDE, NUM_FEATURES, max_windows=None)
         
@@ -360,7 +350,6 @@ def main():
     print(f"Test Windows:  {len(test_windows)}")
     
     # Create DataLoaders
-    # We need to manually collate the list of (tensor, label) tuples
     def collate_fn(batch):
         x = torch.stack([item[0] for item in batch])
         y = torch.stack([item[1] for item in batch])
@@ -370,8 +359,12 @@ def main():
     test_loader = DataLoader(test_windows, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     
     # 5. Define Models
+    
+    mlp_input_dim = WINDOW_SIZE * NUM_FEATURES
+    
     models_to_train = [
-        ("MLP_Classifier", ClassificationMLP(in_channels=NUM_FEATURES, window_size=WINDOW_SIZE)),
+        ("MLP_Classifier", MLP(input_dim=mlp_input_dim, hidden_dim=128)),
+        
         ("CNN_1D", ClassificationCNN(in_channels=NUM_FEATURES))
     ]
     

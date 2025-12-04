@@ -22,19 +22,21 @@ class MLP(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x.view(x.size(0), -1)
-
-        # Through first layer
+        x = x.reshape(x.size(0), -1)
+        
+        # Passing through the network layers
+        
+        # Block 1
         x = self.fc1(x)
         x = self.relu(x)
         x = self.dropout1(x)
-
-        # Secondo layer
+        
+        # Block 2
         x = self.fc2(x)
+        x = self.relu(x)
         x = self.dropout2(x)
-
-        # Output
-
-        x = self.fc3
-
+        
+        # Output layer
+        x = self.fc3(x)
+        
         return x
