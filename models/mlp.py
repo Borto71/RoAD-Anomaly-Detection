@@ -10,7 +10,7 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(input_dim, 128)
 
         # Dropout layer for regularization
-        self.dropout = nn.Dropout(p = 0.3)
+        self.dropout1 = nn.Dropout(p = 0.3)
 
         # second layer, 128 hidden units to output dimension
         self.fc2 = nn.Linear(128, 64)
@@ -20,3 +20,21 @@ class MLP(nn.Module):
         self.fc3 = nn.Linear(64, 2)
 
         self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x.view(x.size(0), -1)
+
+        # Through first layer
+        x = self.fc1(X)
+        x = self.relu(x)
+        x = self.dropout1(x)
+
+        # Secondo layer
+        x = self.fc2(x)
+        x = self.dropout2(x)
+
+        # Output
+
+        x = self.fc3
+
+        return x
