@@ -117,8 +117,8 @@ All results are saved in the `runs_pytorch` and `runs_autogluon` directories, fo
 
 | Model | ROC AUC (Test) | Best F1 (Test) | Accuracy @ 0.5 | BCE Loss (Test) |
 | :--- | :--- | :--- | :--- | :--- |
-| **CNN\_1D (PyTorch)** | [] | [] | [] | [] |
-| **MLP\_Classifier (PyTorch)** | [] | [] | [] | [] |
+| **CNN\_1D (PyTorch)** | [73%] | [67%] | [59%] | [] |
+| **MLP\_Classifier (PyTorch)** | [65%] | [64%] | [70%] | [] |
 | **Best Model (AutoGluon)** | [] | [] | [] | [] |
 
 ### Visualizations
