@@ -11,7 +11,6 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
 
-# --- MODIFICA QUI: Assicurati che nel file models/mlp.py la classe si chiami MLP ---
 from models.cnn_1d import build_model as build_cnn
 from models.mlp import MLP 
 
@@ -192,8 +191,6 @@ def compute_metrics(y_true, scores, thresholds=None):
     return metrics, learning_curve
 
 # MODEL WRAPPERS 
-
-# --- Ho rimosso ClassificationMLP perché il nuovo MLP è già pronto all'uso ---
 
 class ClassificationCNN(nn.Module):
     """
