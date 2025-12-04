@@ -25,7 +25,7 @@ class MLP(nn.Module):
         x.view(x.size(0), -1)
 
         # Through first layer
-        x = self.fc1(X)
+        x = self.fc1(x)
         x = self.relu(x)
         x = self.dropout1(x)
 
