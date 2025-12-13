@@ -12,14 +12,6 @@ class ConvBlock(nn.Module):
     This block keeps the temporal resolution (same T) when:
         padding = dilation * (kernel_size - 1) // 2
         stride = 1
-
-    Args:
-        in_ch:    number of input channels
-        out_ch:   number of output channels
-        k:        kernel size
-        s:        stride
-        dilation: temporal dilation factor
-        dropout:  dropout probability
     """
     def __init__(
         self,
@@ -72,14 +64,6 @@ class ResidualBlock(nn.Module):
 
     If in_ch != out_ch or stride > 1, the shortcut uses a 1x1 conv
     to match shapes.
-
-    Args:
-        in_ch:    input channels
-        out_ch:   output channels
-        k:        kernel size for the main convolutions
-        s:        stride for the first convolution (can be >1 to downsample)
-        dilation: dilation factor for the convolutions
-        dropout:  dropout probability inside the ConvBlocks
     """
     def __init__(
         self,
@@ -148,19 +132,6 @@ class RoADCNN1D(nn.Module):
     - A 1x1 convolution produces per-timestep logits (frame_logits).
     - The sequence-level logit is derived from frame_logits using a pooling
       operation across time (e.g. top-k or max pooling).
-
-    Inputs:
-        x: Tensor of shape (B, C, T)
-           B = batch size, C = feature channels (e.g., 86), T = timesteps.
-
-    Outputs:
-        Forward (supervised-style):
-            (seq_logit, frame_logits)
-            - seq_logit: shape (B, 1), sequence-level anomaly score (raw logit).
-            - frame_logits: shape (B, 1, T), per-timestep logits (or None).
-
-        forward_features (unsupervised-style):
-            z of shape (B, F), embedding per finestra per metodi tipo Deep SVDD.
     """
     def __init__(
         self,
@@ -266,14 +237,6 @@ class RoADCNN1D(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass (supervised-style).
-
-        Args:
-            x: tensor of shape (B, C, T)
-
-        Returns:
-            seq_logit:    (B, 1)   sequence-level logit
-            frame_logits: (B, 1, T) per-timestep logits, or None if
-                          return_frame_logits=False and you wish to save memory.
         """
         # Feature extractor
         x = self._extract_feature_map(x)      # (B, F, T)
@@ -313,10 +276,6 @@ def build_model(
     """
     Factory to create the CNN model. The signature is kept stable so it can be
     imported from a training script.
-
-    Example:
-        from cnn_1d import build_model
-        model = build_model(in_channels=86, base_channels=64, dropout=0.1)
     """
     return RoADCNN1D(
         in_channels=in_channels,
