@@ -341,7 +341,7 @@ def main():
     # Stride for training windows (overlap is fine/desired for training augmentation)
     train_stride = 128 
     # Stride for test windows (must be equal to window_size to prevent overlap/leakage)
-    test_stride = window_size # <-- CORRECTION: Eliminates window overlap in the test set.
+    test_stride = window_size
     
     num_features = 86
     label_col = "is_anomaly"
@@ -401,7 +401,6 @@ def main():
         train_dfs.append(df_tr)
 
         # Build TEST windows (NO overlap: stride=window_size=256)
-        # This resolves the indirect data leakage and provides an honest performance estimate.
         df_te = build_window_dataframe_stats(
             recs_test,
             window_size=window_size,
