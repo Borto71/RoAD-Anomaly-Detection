@@ -1,8 +1,3 @@
-"""
-Simple early stopping utility to halt training when validation loss
-stagnates for a configurable number of epochs.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,12 +15,7 @@ class EarlyStopping:
     should_stop: bool = field(default = False, init = False)
 
     def __call__(self, current_score: float) -> bool:
-        """
-        Update the early stopping state with a new validation loss.
 
-        Returns:
-            bool: True when training should stop.
-        """
         # Initialize tracking during the first call.
         if self.best_score is None:
             self.best_score = current_score

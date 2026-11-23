@@ -5,12 +5,7 @@ import torch.nn.functional as F
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim = 128):
 
-        """
-        A Advanced Multi-Layer Perceptron (MLP) for classification tasks.
-        Args:
-            input_dim (int): Dimension of the input features.
-            hidden_dim (int): Number of hidden units in the hidden layers.
-        """
+        """An Advanced Multi-Layer Perceptron (MLP) for classification tasks."""
         super(MLP, self).__init__()
         # Block 1, big inital reduction
         self.layer1 = nn.Sequential(nn.Linear(input_dim, 512), nn.BatchNorm1d(512), nn.LeakyReLU(0.1), nn.Dropout(0.4))

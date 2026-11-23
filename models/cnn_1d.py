@@ -5,14 +5,7 @@ import torch.nn.functional as F
 
 
 class ConvBlock(nn.Module):
-    """
-    Basic 1D convolutional block:
-    Conv1d -> BatchNorm1d -> GELU (or other non-linearity) -> Dropout.
-
-    This block keeps the temporal resolution (same T) when:
-        padding = dilation * (kernel_size - 1) // 2
-        stride = 1
-    """
+    """Basic 1D convolutional block"""
     def __init__(
         self,
         in_ch: int,
@@ -41,13 +34,7 @@ class ConvBlock(nn.Module):
         self.drop = nn.Dropout(p=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: tensor of shape (B, C_in, T)
 
-        Returns:
-            Tensor of shape (B, C_out, T_out)
-        """
         x = self.conv(x)
         x = self.bn(x)
         x = self.act(x)
@@ -57,14 +44,7 @@ class ConvBlock(nn.Module):
 
 class ResidualBlock(nn.Module):
     """
-    Residual block with two ConvBlocks and an optional 1x1 shortcut.
-
-    The main idea is:
-        y = F(main(x) + shortcut(x))
-
-    If in_ch != out_ch or stride > 1, the shortcut uses a 1x1 conv
-    to match shapes.
-    """
+    Residual block with two ConvBlocks and an optional 1x1 shortcut"""
     def __init__(
         self,
         in_ch: int,
@@ -85,7 +65,6 @@ class ResidualBlock(nn.Module):
             dropout=dropout,
         )
         # Second conv keeps stride=1 so that only the first convolution
-        # controls the potential downsampling.
         self.conv2 = ConvBlock(
             out_ch,
             out_ch,
@@ -108,13 +87,6 @@ class ResidualBlock(nn.Module):
         self.out_act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: tensor of shape (B, C_in, T)
-
-        Returns:
-            Tensor of shape (B, C_out, T_out)
-        """
         residual = self.shortcut(x)
         out = self.conv1(x)
         out = self.conv2(out)
@@ -125,14 +97,7 @@ class ResidualBlock(nn.Module):
 
 class RoADCNN1D(nn.Module):
     """
-    CNN-1D model for anomaly detection on multi-variate time series.
-
-    Base design:
-    - The network preserves the temporal resolution (same T) throughout.
-    - A 1x1 convolution produces per-timestep logits (frame_logits).
-    - The sequence-level logit is derived from frame_logits using a pooling
-      operation across time (e.g. top-k or max pooling).
-    """
+    CNN-1D model for anomaly detection on multi-variate time series"""
     def __init__(
         self,
         in_channels: int = 86,      # number of input features; exclude label channel
@@ -211,9 +176,6 @@ class RoADCNN1D(nn.Module):
 
     # Feature extraction utilities
     def _extract_feature_map(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Passa l'input attraverso stem + stage1..4 e ritorna il feature map (B, F, T).
-        """
         x = self.stem(x)
         x = self.stage1(x)
         x = self.stage2(x)
@@ -222,22 +184,12 @@ class RoADCNN1D(nn.Module):
         return x
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Estrae un embedding di finestra di shape (B, F) per metodi unsupervised
-        tipo Deep SVDD.
-
-        - x: (B, C_in, T)
-        - ritorno: (B, F) dove F = base_channels * 4
-        """
         feat = self._extract_feature_map(x)   # (B, F, T)
         z = feat.mean(dim=-1)                # global average pooling su T -> (B, F)
         return z
 
     # Forward 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass (supervised-style).
-        """
         # Feature extractor
         x = self._extract_feature_map(x)      # (B, F, T)
 
@@ -253,7 +205,6 @@ class RoADCNN1D(nn.Module):
             seq_logit, _ = frame_logits.max(dim=-1)  # (B, 1)
         else:
             # Top-k pooling (default):
-            # take the mean over the k most anomalous timesteps.
             B, C, T = frame_logits.shape
             k = max(1, int(self.topk_ratio * T))
             topk_vals, _ = torch.topk(frame_logits, k=k, dim=-1)
@@ -262,8 +213,6 @@ class RoADCNN1D(nn.Module):
         if self.return_frame_logits:
             return seq_logit, frame_logits
         else:
-            # If you do not need per-frame scores (e.g., at inference), you can
-            # set return_frame_logits=False when building the model to save memory.
             return seq_logit, None
 
 
@@ -273,10 +222,6 @@ def build_model(
     dropout: float = 0.1,
     return_frame_logits: bool = False,
 ) -> RoADCNN1D:
-    """
-    Factory to create the CNN model. The signature is kept stable so it can be
-    imported from a training script.
-    """
     return RoADCNN1D(
         in_channels=in_channels,
         base_channels=base_channels,
